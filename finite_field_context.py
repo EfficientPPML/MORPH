@@ -346,23 +346,25 @@ class DRNSlazyContext(DRNSlazyContextBase, JaxKernelContextBase):
     self._init_jax_parameters()
 
   def to_computational_format(self, a: Union[int, list]) -> jnp.ndarray:
-    def individual_convert(a: int) -> jnp.ndarray:
-      return jnp.array([(((a % m) << self.radix_bits) % m) for m in self.rns_moduli], dtype=jnp.uint32)
+    moduli = self.rns_moduli
+    radix_bits = self.radix_bits
+
+    def individual_convert(a: int) -> list:
+      return [(((a % m) << radix_bits) % m) for m in moduli]
 
     def recursive_convert(a):
       if isinstance(a, int):
         return individual_convert(a)
-      return jnp.array([recursive_convert(a_i) for a_i in a], dtype=jnp.uint32)
+      return [recursive_convert(a_i) for a_i in a]
 
-    converted_a = recursive_convert(a)
+    converted_list = recursive_convert(a)
+    converted_a = jnp.array(np.array(converted_list, dtype=np.uint32), dtype=jnp.uint32)
     if self.use_sharding:
       named_sharding, padded_shape = self.create_named_sharding(shape=converted_a.shape, axes=[0])
       converted_a = pad_jax_array(converted_a, padded_shape)
       return converted_a.to_device(named_sharding)
     else:
-      return converted_a.to_device(jax.devices("tpu")[0])
-
-    return recursive_convert(a)
+      return converted_a.to_device(jax.devices()[0])
 
   def to_original_format(self, a: jnp.ndarray) -> Union[int, list]:
     def individual_convert(a: list[int]) -> int:
@@ -581,8 +583,8 @@ class DRNSlazyContext(DRNSlazyContextBase, JaxKernelContextBase):
   def _modular_multiply(self, a: jnp.ndarray, b: jnp.ndarray) -> jnp.ndarray:
     z = jnp.multiply(a.astype(jnp.uint64), b.astype(jnp.uint64))
     z_reduced = self._jax_montgomery_reduce(z)
-    z_rns_reduced = self._jax_crns(z_reduced)
-    z_reduced = self._jax_montgomery_reduce(z_rns_reduced)
+    z_rns_reduced = self._jax_crns(z_reduced) # could be skipped for small prime
+    z_reduced = self._jax_montgomery_reduce(z_rns_reduced) # could be skipped for small prime (paired with the above)
     return z_reduced
 
   def _modular_add(self, a: jnp.ndarray, b: jnp.ndarray) -> jnp.ndarray:
@@ -602,7 +604,7 @@ class DRNSlazyContext(DRNSlazyContextBase, JaxKernelContextBase):
   def modular_multiply(self, a: jax.Array, b: jax.Array) -> jax.Array:
     kernel_hash = hash_args(a.shape, a.dtype.__str__())
     if self.use_compiled_kernels:
-      # print(f"using compiled kernel for modular_multiply: {kernel_hash}")
+      print(f"using compiled kernel for modular_multiply: {kernel_hash}")
       return self.compiled_kernels[kernel_hash]["modular_multiply"](a, b)
     else:
       return self._modular_multiply(a, b)
@@ -668,10 +670,17 @@ class LazyContextBase(FiniteFieldContextBase):
 
   def __init__(self, parameters: dict):
     super().__init__(parameters)
-    self.chunk_num_u8 = parameters.get(
+    raw_chunk_num_u8 = parameters.get(
         "chunk_num_u8", math.ceil(self.prime.bit_length() / 8)
     )
+    # The byte pipeline in ``_mul_to_u8`` emits a ``4 * 2 * chunk_num_u32``-byte
+    # buffer, and ``_modular_multiply`` slices ``high = vc[:, n8:2*n8+4]``
+    # against a ``(n8+4, n8)`` lazy matrix.  The slice only fits when
+    # ``chunk_num_u8`` is a multiple of 4; round up so the invariant holds
+    # for primes with arbitrary bit-length.
+    self.chunk_num_u8 = ((raw_chunk_num_u8 + 3) // 4) * 4
     self.chunk_num_u32 = self.chunk_num_u8 // 4 + 1
+    self.rns_moduli = self.chunk_num_u32
     self.word_mask = (1 << 32) - 1
     self.modulus_lazy_mat = self._construct_lazy_matrix()
     self.prime_chunk = tuple(self._int_to_array(self.prime, self.chunk_num_u32))
@@ -707,11 +716,6 @@ class LazyContextBase(FiniteFieldContextBase):
 
 class CROSSLazyContext(LazyContextBase, JaxKernelContextBase):
   """Lazy matrix modular multiplication context for JAX.
-
-  Ports mod_mul_lazy_2u32 from jaxite_ec_lazy_32 as a FiniteFieldContextBase
-  implementation.  Multiplies two field elements represented as uint32 chunk
-  arrays using a precomputed lazy reduction matrix to fold the high bytes of
-  the full product back into the field.
   """
 
   def __init__(self, parameters: dict):
@@ -737,7 +741,7 @@ class CROSSLazyContext(LazyContextBase, JaxKernelContextBase):
       converted_a = pad_jax_array(converted_a, padded_shape)
       return converted_a.to_device(named_sharding)
     else:
-      return converted_a.to_device(jax.devices("tpu")[0])
+      return converted_a.to_device(jax.devices()[0])
 
   def to_original_format(self, a: jnp.ndarray):
     def _convert(arr) -> int:
@@ -841,7 +845,7 @@ class CROSSLazyContext(LazyContextBase, JaxKernelContextBase):
   def modular_multiply(self, a: jax.Array, b: jax.Array) -> jax.Array:
     kernel_hash = hash_args(a.shape, a.dtype.__str__())
     if self.use_compiled_kernels:
-      # print(f"using compiled kernel for modular_multiply: {kernel_hash}")
+      print(f"using compiled kernel for modular_multiply: {kernel_hash}")
       return self.compiled_kernels[kernel_hash]["modular_multiply"](a, b)
     else:
       return self._modular_multiply(a, b)

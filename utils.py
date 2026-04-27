@@ -389,6 +389,8 @@ class JaxKernelContextBase:
     self.compiled_kernels = {}
     self.use_compiled_kernels = use_compiled_kernels
     self.use_sharding = False
+    self.sharding_mesh = None
+    self.mesh_axes = ()
 
   def set_use_compiled_kernels(self, use_compiled_kernels: bool):
     self.use_compiled_kernels = use_compiled_kernels
@@ -411,12 +413,36 @@ class JaxKernelContextBase:
       self.sharding_mesh = mesh
       self.sharding_partition = partition
       self.sharding_partition_spec = partition_spec
+      self.mesh_axes = tuple(mesh.axis_names)
     else:
       self.use_sharding = False
       self.sharding_mesh = None
       self.sharding_partition = None
       self.sharding_partition_spec = None
+      self.mesh_axes = ()
 
+
+  def make_named_sharding(self, spec) -> "jax.sharding.NamedSharding | None":
+    """Wrap a PartitionSpec in a NamedSharding bound to the current mesh.
+
+    Returns None if sharding is disabled.
+    """
+    mesh = getattr(self, "sharding_mesh", None)
+    if mesh is None:
+      return None
+    return jax.sharding.NamedSharding(mesh, spec)
+
+  def shard_constraint(self, x, spec):
+    """Apply ``with_sharding_constraint(x, NamedSharding(mesh, spec))``.
+
+    No-op when sharding is disabled. Intended for use inside jitted
+    kernels to pin intermediate layouts.
+    """
+    mesh = getattr(self, "sharding_mesh", None)
+    if mesh is None:
+      return x
+    return jax.lax.with_sharding_constraint(
+        x, jax.sharding.NamedSharding(mesh, spec))
 
   def create_named_sharding(self, shape: tuple, axes: list[int]) -> tuple[jax.sharding.NamedSharding, tuple]:
     """Create an efficient NamedSharding for the given shape and shard axes.
@@ -454,7 +480,7 @@ class JaxKernelContextBase:
     padded_shape = list(shape)
 
     # Minimum elements per device below which sharding is not worthwhile
-    _MIN_ELEMS_PER_DEVICE = 2
+    _MIN_ELEMS_PER_DEVICE = 1
 
     if len(axes) == 1:
       axis = axes[0]

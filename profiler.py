@@ -259,6 +259,102 @@ def calculate_statistics(data: List[Any]) -> Dict[str, Any]:
   }
 
 
+def analyze_trace_bottlenecks(
+    trace_folder: str,
+    top_k: int = 10,
+    device_pid: int = 3,
+) -> List[Dict[str, Any]]:
+  """Analyze a single-iteration TPU trace and return the top-K bottleneck ops.
+
+  Each returned entry contains the op name, duration, source file/line,
+  abbreviated source stack, HLO category, estimated FLOPs, and bytes
+  accessed — everything needed to identify where kernel time is spent
+  and which Python line produced the HLO op.
+
+  Args:
+    trace_folder: Path to an iteration's trace folder (contains
+      ``plugins/profile/<timestamp>/*.trace.json.gz``).
+    top_k: Number of top ops to return, sorted by duration descending.
+    device_pid: The ``pid`` of the target TPU device in the trace
+      (default 3 = ``/device:TPU:0``).
+
+  Returns:
+    A list of dicts, each with keys:
+      ``name``, ``dur_us``, ``pct``, ``source``, ``source_stack``,
+      ``hlo_category``, ``model_flops``, ``bytes_accessed``.
+  """
+  parser = TraceParser(trace_folder)
+  trace_json = parser.read_trace_json()
+  if trace_json is None:
+    return []
+  events = trace_json.get("traceEvents", [])
+
+  # Keep only device-level duration events for the target PID.
+  dev_events = [
+      e for e in events
+      if e.get("pid") == device_pid
+      and e.get("ph") == "X"
+      and e.get("dur") is not None
+  ]
+  if not dev_events:
+    return []
+
+  total_us = sum(e["dur"] for e in dev_events)
+  dev_events.sort(key=lambda e: -e["dur"])
+
+  results = []
+  for e in dev_events[:top_k]:
+    args = e.get("args") or {}
+    source = args.get("source", "")
+    stack_raw = args.get("source_stack", "")
+    # Trim the stack to just the user-code frames (skip jax internals).
+    stack_lines = []
+    if stack_raw:
+      for line in stack_raw.strip().split("\n"):
+        line = line.strip()
+        if not line:
+          continue
+        # Keep lines from the user's project; skip jax/site-packages.
+        if "site-packages" not in line:
+          stack_lines.append(line)
+    results.append({
+        "name": e.get("name", ""),
+        "dur_us": e["dur"],
+        "pct": 100.0 * e["dur"] / total_us if total_us else 0,
+        "source": source,
+        "source_stack": stack_lines,
+        "hlo_category": args.get("hlo_category", ""),
+        "model_flops": args.get("model_flops", 0),
+        "bytes_accessed": args.get("bytes_accessed", 0),
+    })
+  return results
+
+
+def print_trace_bottlenecks(
+    trace_folder: str,
+    top_k: int = 10,
+    device_pid: int = 3,
+) -> None:
+  """Pretty-print the top-K bottleneck ops from a single-iteration trace.
+
+  Convenience wrapper around :func:`analyze_trace_bottlenecks`.
+  """
+  bottlenecks = analyze_trace_bottlenecks(trace_folder, top_k, device_pid)
+  if not bottlenecks:
+    print("  (no device events found)")
+    return
+  print(f"  {'Rank':<5} {'Dur (ms)':>10} {'%':>6}  {'Category':<12} {'Op Name':<40} {'Source'}")
+  print("  " + "-" * 110)
+  for i, b in enumerate(bottlenecks):
+    print(
+        f"  {i+1:<5} {b['dur_us']/1000:>10.2f} {b['pct']:>5.1f}%"
+        f"  {b['hlo_category']:<12} {b['name'][:40]:<40} {b['source']}"
+    )
+    if b["source_stack"]:
+      for frame in b["source_stack"][:3]:
+        print(f"  {'':>24} ↳ {frame}")
+
+
 def list_add(list1: List[Any], list2: List[Any]) -> List[Any]:
   """Sum two lists element-wise.
 
@@ -273,7 +369,52 @@ def list_add(list1: List[Any], list2: List[Any]) -> List[Any]:
   return [e1 + e2 for e1, e2 in zip(list1, list2)]
 
 
-class KernelWrapper:
+class KernelWrapperBase:
+  """Unified interface consumed by ``Profiler``.
+
+  Subclasses expose a callable (``get_compiled_function``) plus the metadata
+  the profiler needs to feed and account for it. The profiler never branches
+  on the concrete wrapper type — it only calls methods defined here.
+  """
+
+  def __init__(
+      self,
+      kernel_name: str,
+      input_structs: List[Tuple[Tuple[int, ...], jnp.dtype]],
+      mesh: Optional[jax.sharding.Mesh] = None,
+      input_shardings: Optional[Tuple[jax.sharding.Sharding, ...]] = None,
+      output_sharding: Optional[jax.sharding.Sharding] = None,
+      enable_sharding: bool = False,
+  ):
+    self.kernel_name = kernel_name
+    self.input_structs = input_structs
+    self.mesh = mesh
+    self.input_shardings = input_shardings
+    self.output_sharding = output_sharding
+    self.enable_sharding = enable_sharding
+    self.callable_function_name = None
+    self.jit_function_name = None
+  # ---- Profiler-facing unified API ----
+  def get_compiled_function(self) -> Callable[..., jnp.ndarray]:
+    raise NotImplementedError
+
+  def get_input_structs(self) -> List[Tuple[Tuple[int, ...], jnp.dtype]]:
+    return self.input_structs
+
+  def get_kernel_name(self) -> str:
+    return self.kernel_name
+
+  def get_input_arrays(self) -> Optional[List[jnp.ndarray]]:
+    """Return concrete inputs, or None to let Profiler fabricate random ones."""
+    return None
+
+  def shard_inputs(self, input_arrays: List[jnp.ndarray]) -> List[jnp.ndarray]:
+    if self.enable_sharding and self.input_shardings:
+      return [jax.device_put(arr, s) for arr, s in zip(input_arrays, self.input_shardings)]
+    return input_arrays
+
+
+class KernelWrapper(KernelWrapperBase):
 
   def __init__(
       self,
@@ -286,14 +427,16 @@ class KernelWrapper:
       parameters: Optional[Dict[str, Any]] = {},
       enable_sharding: bool = False,
   ):
-    self.kernel_name = kernel_name
+    super().__init__(
+        kernel_name=kernel_name,
+        input_structs=input_structs,
+        mesh=mesh,
+        input_shardings=input_shardings,
+        output_sharding=output_sharding,
+        enable_sharding=enable_sharding,
+    )
     self.callable_function = function_to_wrap
-    self.input_structs = input_structs
     self.parameters = parameters
-    self.mesh = mesh
-    self.input_shardings = input_shardings
-    self.output_sharding = output_sharding
-    self.enable_sharding = enable_sharding
 
     self.jit_lower = None
     self.jit_compiled_function = None
@@ -346,16 +489,51 @@ class KernelWrapper:
       return compiled_with_mesh
     return self.jit_compiled_function
 
-  def get_input_structs(self):
-    return self.input_structs
 
-  def get_kernel_name(self) -> str:
-    return self.kernel_name
+class PrecompiledKernelWrapper(KernelWrapperBase):
+  """Wrapper around an already-compiled/externally-managed callable.
+
+  Unlike ``KernelWrapper``, this does NOT re-trace the function under
+  ``jax.jit``. Use it when the callable already dispatches to pre-compiled
+  executables or carries internal state that cannot be safely re-jitted
+  (e.g. a stateful context method like ``FusionMSMContext.multiscalar_multiply``
+  which internally looks up pre-compiled, pre-sharded kernels).
+
+  The wrapper also takes concrete input arrays directly — Profiler will use
+  them as-is instead of fabricating random inputs from shape/dtype, which is
+  essential when the inputs must match a specific layout (sharding, padding)
+  baked into the compiled kernel.
+  """
+
+  def __init__(
+      self,
+      kernel_name: str,
+      callable_function: Callable,
+      input_arrays: List[jnp.ndarray],
+      enable_sharding: bool = False,
+      callable_function_name: Optional[str] = None,
+  ):
+    input_arrays = list(input_arrays)
+    super().__init__(
+        kernel_name=kernel_name,
+        input_structs=[(a.shape, a.dtype) for a in input_arrays],
+        enable_sharding=enable_sharding,
+    )
+    self.callable_function = callable_function
+    self._input_arrays = input_arrays
+    self.callable_function_name = callable_function_name
+    self.jit_function_name = f"jit_{callable_function_name}" if callable_function_name else None
+
+
+  def get_compiled_function(self) -> Callable[..., jnp.ndarray]:
+    return self.callable_function
+
+  def get_input_arrays(self) -> List[jnp.ndarray]:
+    """Concrete inputs preserved as-is (sharding, layout, device placement)."""
+    return self._input_arrays
 
   def shard_inputs(self, input_arrays: List[jnp.ndarray]) -> List[jnp.ndarray]:
-    """Place inputs on the provided sharding."""
-    if self.enable_sharding and self.input_shardings:
-      return [jax.device_put(arr, sharding) for arr, sharding in zip(input_arrays, self.input_shardings)]
+    # Inputs were provided pre-placed; nothing to do.
     return input_arrays
 
 
@@ -380,7 +558,7 @@ class Profiler:
     # Storage for results
     self.storage_file = os.path.join(self.profile_dir, f"{self.profiler_name}_results.csv")
 
-  def add_profile(self, name: str, kernel_wrapper: KernelWrapper, kernel_setting_cols: Dict[str, Any] = {}):
+  def add_profile(self, name: str, kernel_wrapper: "KernelWrapperBase", kernel_setting_cols: Dict[str, Any] = {}):
     if name in self.profile_name_list:
       raise ValueError(f"Profiler name {name} already exists")
 
@@ -403,7 +581,15 @@ class Profiler:
         }
     )
 
-  def _get_input_arrays(self, kernel_wrapper: KernelWrapper):
+  def _get_input_arrays(self, kernel_wrapper: "KernelWrapperBase"):
+    # If the wrapper carries concrete inputs (e.g. pre-sharded, pre-padded
+    # arrays bound to an already-compiled kernel), use them verbatim.
+    provided = kernel_wrapper.get_input_arrays()
+    if provided is not None:
+      for arr in provided:
+        arr.block_until_ready()
+      return provided
+
     def get_max_value(dtype):
       if dtype == jnp.uint8:
         return 128
@@ -442,22 +628,50 @@ class Profiler:
         compiled_function = profile["wrapper"].get_compiled_function()
         input_arrays = self._get_input_arrays(profile["wrapper"])
 
-        with jax.profiler.trace(profile["folder"]):
-          for _ in range(self.iterations):
+        # Run each iteration in its own trace window so that the TPU
+        # trace buffer is not shared across iterations to avoid buffer
+        # overflow problem for kernel with long running time.
+        iter_folders = []
+        for i in range(self.iterations):
+          iter_folder = os.path.join(profile["folder"], f"iter_{i}")
+          os.makedirs(iter_folder, exist_ok=True)
+          with jax.profiler.trace(iter_folder):
             compiled_function(*input_arrays).block_until_ready()
+          iter_folders.append(iter_folder)
+        profile["iter_folders"] = iter_folders
       except Exception as e:
         print(f"Error profiling {profile['name']}:\n {e}")
         profile["failed"] = True
 
   def _parse_json_trace(self, profile):
-    trace_parser = TraceParser(profile["folder"])
-    trace_file_path = trace_parser.find_trace_file()
-    profile_json = trace_parser.read_trace_json()
-    if profile_json is None:
-      warnings.warn(f"{profile['name']}: No trace events found in the data", UserWarning)
-      profile["failed"] = True
-      return None
-    trace_events = profile_json.get("traceEvents", [])
+    # With per-iteration trace windows, merge trace events from all
+    # iteration sub-folders into one combined list.
+    iter_folders = profile.get("iter_folders", [])
+    if iter_folders:
+      all_trace_events = []
+      trace_file_path = None
+      for folder in iter_folders:
+        parser = TraceParser(folder)
+        tfp = parser.find_trace_file()
+        if tfp is None:
+          continue
+        if trace_file_path is None:
+          trace_file_path = tfp
+        pjson = parser.read_trace_json()
+        if pjson is not None:
+          all_trace_events.extend(pjson.get("traceEvents", []))
+      trace_events = all_trace_events
+    else:
+      # Legacy path: single trace folder.
+      trace_parser = TraceParser(profile["folder"])
+      trace_file_path = trace_parser.find_trace_file()
+      profile_json = trace_parser.read_trace_json()
+      if profile_json is None:
+        warnings.warn(f"{profile['name']}: No trace events found in the data", UserWarning)
+        profile["failed"] = True
+        return None
+      trace_events = profile_json.get("traceEvents", [])
+
     if not trace_events:
       warnings.warn(f"{profile['name']}: No trace events found in the data", UserWarning)
       profile["failed"] = True
@@ -527,12 +741,16 @@ class Profiler:
       profile["filtered_events"] = merge_filtered_events_by_name(filtered_events_list)
 
     elif "TPU" in device_kind:
+      jit_function_name = profile["wrapper"].jit_function_name
       for event in trace_events:
         if (
             "pid" not in event.keys() or event["pid"] != 3
         ):  # ToDo: change it into automatic PID detection based on "TPU:0".
           continue
         if "name" in event.keys() and "compiled_kernel_function" in event["name"] and "args" in event.keys():
+          filtered_events_list.append(event)
+        elif "name" in event.keys() and jit_function_name is not None and jit_function_name in event["name"]:
+          # print(f"Found jit function name {jit_function_name} in event {event['name']}")
           filtered_events_list.append(event)
         elif "args" in event.keys() and "long_name" in event["args"].keys():
           filtered_events_list.append(event)
@@ -583,9 +801,38 @@ class Profiler:
             # Ideally log a warning.
             kernel_duration = list_add(kernel_duration, durations[:repeat_count])
     elif "TPU" in device_kind:
+      jit_function_name = profile["wrapper"].jit_function_name
       for event in profile["filtered_events"].values():
-        if "compiled_kernel_function" in event["name"]:
-          kernel_duration = list_add(kernel_duration, event["dur"])
+        matches = (
+            "compiled_kernel_function" in event["name"]
+            or (jit_function_name is not None and jit_function_name in event["name"])
+        )
+        if not matches:
+          continue
+        durations = event["dur"]
+        if not isinstance(durations, list):
+          durations = [durations]
+        # At larger problem sizes XLA can coalesce per-device event replays
+        # unevenly, producing either a multiple of ``repeat_count`` (one
+        # kernel invocation expanded into several sub-events per iteration)
+        # or fewer samples than ``repeat_count`` (some replays elided).
+        # Mirror the NVIDIA branch's bucket-and-fallback logic instead of
+        # blindly zip-adding, which used to assert out and abort the
+        # post-processing before the CSV was written.
+        if len(durations) == repeat_count:
+          kernel_duration = list_add(kernel_duration, durations)
+        elif len(durations) > repeat_count and len(durations) % repeat_count == 0:
+          chunk_size = len(durations) // repeat_count
+          aggregated = [
+              sum(durations[i * chunk_size : (i + 1) * chunk_size])
+              for i in range(repeat_count)
+          ]
+          kernel_duration = list_add(kernel_duration, aggregated)
+        elif len(durations) < repeat_count:
+          padded = durations + [0] * (repeat_count - len(durations))
+          kernel_duration = list_add(kernel_duration, padded)
+        else:
+          kernel_duration = list_add(kernel_duration, durations[:repeat_count])
     else:
       # CPU logic - assuming direct name match from filtered events
       for event in profile["filtered_events"].values():

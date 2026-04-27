@@ -56,6 +56,7 @@ class FiniteFieldTest(parameterized.TestCase):
   @parameterized.named_parameters(*FF)
   def test_lazy_modular_multiply(self, value_a, value_b):
     prime = 0x01AE3A4617C510EAC63B05C06CA1493B1A22D9F300F5138F1EF3622FBA094800170B5D44300000008508C00000000001
+
     ref_value_c = [(a * b) % prime for a, b in zip(value_a, value_b)]
 
     ctx = ff_context.CROSSLazyContext({"prime": prime, "chunk_num_u8": 48})

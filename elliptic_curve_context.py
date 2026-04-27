@@ -1,12 +1,19 @@
 from abc import ABC, abstractmethod
 import math
 import logging
+import multiprocessing
 from typing import Tuple, Union
 import copy
 import numpy as np
 import warnings
+import os
+from concurrent.futures import ProcessPoolExecutor
+from functools import partial
 import jax
 import jax.numpy as jnp
+
+# Use 'forkserver' to avoid JAX multithreading + fork deadlock
+_MP_CONTEXT = multiprocessing.get_context("forkserver")
 
 import utils
 from utils import JaxParameters, JaxKernelContextBase, hash_args, pad_jax_array, store_jax_executable, load_jax_executable, jax_jit_lower_compile
@@ -259,7 +266,7 @@ class ExtendedTwistedEdwardsContext(ExtendedTwistedEdwardsContextBase, JaxKernel
       result = pad_jax_array(result, padded_shape)
       return result.to_device(named_sharding)
     else:
-      return result.to_device(jax.devices("tpu")[0])
+      return result.to_device(jax.devices()[0])
 
 
   def to_original_format(self, a: jnp.ndarray) -> list:
@@ -296,6 +303,8 @@ class ExtendedTwistedEdwardsContext(ExtendedTwistedEdwardsContextBase, JaxKernel
     e1 = self.ff_ctx._modular_add(pax, pay)
     e2 = self.ff_ctx._modular_add(pbx, pby)
     twist_d_here = jnp.broadcast_to(twist_d.reshape(-1, twist_d.shape[0]), c.shape)
+    if self.use_sharding:
+      twist_d_here = jax.sharding.reshard(twist_d_here, jax.typeof(e2).sharding)
     inputsl = jnp.concatenate((e1, c), axis=0)
     inputsr = jnp.concatenate((e2, twist_d_here), axis=0)
     outputs = self.ff_ctx._modular_multiply(inputsl, inputsr)
@@ -403,6 +412,25 @@ class ExtendedTwistedEdwardsContext(ExtendedTwistedEdwardsContextBase, JaxKernel
     self.use_compiled_kernels = True
 
 
+def _twist_extend_and_rns_worker(point, s, alpha, prime, prime_m2, t, rns_moduli, radix_bits):
+  """Module-level worker: twist + extend + RNS conversion using gmpy2 (must be picklable)."""
+  import gmpy2
+  x, y = gmpy2.mpz(point[0]), gmpy2.mpz(point[1])
+  xm = (s * (x - alpha)) % prime
+  ym = (s * y) % prime
+  if ym == 0:
+    raise ValueError("ec twist: ym is zero")
+  xt = (xm * gmpy2.powmod(ym, prime_m2, prime)) % prime
+  yt_denom = xm + 1
+  if yt_denom == 0:
+    raise ValueError("ec twist: yt_denom is zero")
+  yt = ((xm - 1) * gmpy2.powmod(yt_denom, prime_m2, prime)) % prime
+  xt = (xt * t) % prime
+  coords = [int(xt), int(yt), 1, int((xt * yt) % prime)]
+  # RNS conversion inline: (a % m) << radix_bits) % m for each coordinate
+  return [[(((c % m) << radix_bits) % m) for m in rns_moduli] for c in coords]
+
+
 class ExtendedTwistedEdwardsNDContext(ExtendedTwistedEdwardsContextBase, JaxKernelContextBase):
   """Extended Twisted Edwards context supporting arbitrary batch dimensions.
 
@@ -430,22 +458,43 @@ class ExtendedTwistedEdwardsNDContext(ExtendedTwistedEdwardsContextBase, JaxKern
     if list_depth < 1:
       raise ValueError(f"Invalid list depth {list_depth} for point conversion")
 
-    def recursive_twist(lst, depth):
-      if depth == 1:
-        return self._convert_to_extended_twisted_edwards(lst)
-      return [recursive_twist(item, depth - 1) for item in lst]
-
-    twisted_coords = recursive_twist(a, list_depth)
-    result = self.ff_ctx.to_computational_format(twisted_coords)
-
-    if list_depth == 1:
-      # (4, precision) → (4, 1, precision)
-      result = jnp.expand_dims(result, axis=1)
+    # Use parallel processing with gmpy2 for large flat batches of points (depth==2)
+    # Fuses twist + extend + RNS conversion into one parallel step
+    _PARALLEL_THRESHOLD = 2048
+    if list_depth == 2 and len(a) >= _PARALLEL_THRESHOLD:
+      import gmpy2
+      ff_ctx = self.ff_ctx
+      worker = partial(
+          _twist_extend_and_rns_worker,
+          s=gmpy2.mpz(self.s), alpha=gmpy2.mpz(self.alpha),
+          prime=gmpy2.mpz(self.prime), prime_m2=gmpy2.mpz(self.prime - 2),
+          t=gmpy2.mpz(self.t),
+          rns_moduli=ff_ctx.rns_moduli, radix_bits=ff_ctx.radix_bits,
+      )
+      num_workers = min(64, os.cpu_count() or 1, max(1, len(a) // 256))
+      with ProcessPoolExecutor(max_workers=num_workers, mp_context=_MP_CONTEXT) as pool:
+        rns_coords = list(pool.map(worker, a, chunksize=max(1, len(a) // num_workers)))
+      # rns_coords: list of (4, moduli_num) per point → (N, 4, moduli_num) array
+      result = jnp.array(np.array(rns_coords, dtype=np.uint32), dtype=jnp.uint32)
+      # (N, 4, moduli_num) → (4, N, moduli_num)
+      result = result.transpose(1, 0, 2)
     else:
-      # (*batch_dims, 4, precision) → (4, *batch_dims, precision)
-      ndim = result.ndim
-      perm = (ndim - 2,) + tuple(range(ndim - 2)) + (ndim - 1,)
-      result = result.transpose(perm)
+      def recursive_twist(lst, depth):
+        if depth == 1:
+          return self._convert_to_extended_twisted_edwards(lst)
+        return [recursive_twist(item, depth - 1) for item in lst]
+      twisted_coords = recursive_twist(a, list_depth)
+
+      result = self.ff_ctx.to_computational_format(twisted_coords)
+
+      if list_depth == 1:
+        # (4, precision) → (4, 1, precision)
+        result = jnp.expand_dims(result, axis=1)
+      else:
+        # (*batch_dims, 4, precision) → (4, *batch_dims, precision)
+        ndim = result.ndim
+        perm = (ndim - 2,) + tuple(range(ndim - 2)) + (ndim - 1,)
+        result = result.transpose(perm)
 
     if self.use_sharding:
       shard_axes = list(range(1, min(3, result.ndim - 1)))
@@ -455,7 +504,7 @@ class ExtendedTwistedEdwardsNDContext(ExtendedTwistedEdwardsContextBase, JaxKern
       result = pad_jax_array(result, padded_shape)
       return result.to_device(named_sharding)
     else:
-      return result.to_device(jax.devices("tpu")[0])
+      return result.to_device(jax.devices()[0])
 
   def to_original_format(self, a: jnp.ndarray) -> list:
     ndim = a.ndim
@@ -498,6 +547,12 @@ class ExtendedTwistedEdwardsNDContext(ExtendedTwistedEdwardsContextBase, JaxKern
     e1 = self.ff_ctx._modular_add(pax, pay)
     e2 = self.ff_ctx._modular_add(pbx, pby)
     twist_d_here = jnp.broadcast_to(twist_d, c.shape)
+    try:
+      _e2_sh = jax.typeof(e2).sharding
+      if _e2_sh is not None:
+        twist_d_here = jax.sharding.reshard(twist_d_here, _e2_sh)
+    except Exception:
+      pass
     inputsl = jnp.concatenate((e1, c), axis=0)
     inputsr = jnp.concatenate((e2, twist_d_here), axis=0)
     outputs = self.ff_ctx._modular_multiply(inputsl, inputsr)
