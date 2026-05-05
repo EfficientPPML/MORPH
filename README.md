@@ -89,10 +89,42 @@ pip install pandas
 pip install gmpy2
 ```
 
-Step 3: Download the reference data
+Step 3: Install the C++ toolchain for the MSM C kernel.
+
+The MSM path uses a CPU C kernel (`c_kernels/distribution.cpp`) that is
+compiled on the first import of `multiscalar_multiplication_context`. You need
+a host `g++` with OpenMP, and the conda env's bundled `libstdc++` must be
+recent enough to satisfy the symbols emitted by that compiler. On modern Ubuntu
+(g++ 13+) this means `GLIBCXX_3.4.32`, which the conda default
+`libstdcxx-ng 11.2.0` does **not** ship — so install a newer one from
+`conda-forge`:
+```
+sudo apt-get install -y g++          # skip if already installed
+conda install -n jaxite -c conda-forge 'libstdcxx-ng>=13' 'libgcc-ng>=13'
+```
+If you see `OSError: ... libstdc++.so.6: version 'GLIBCXX_3.4.XX' not found`
+when importing `multiscalar_multiplication_context`, the conda libstdc++ is
+older than your system `g++` — re-run the `conda install` line above (or
+`LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6` for a one-shot
+workaround).
+
+Step 4: Download the reference data
 ```
 mkdir -p data && gdown 1aJhANlS8hWrjSt9j0nBKoFRBoZh0W1aa -O data/data.tar.gz && cd data && tar -xvf data.tar.gz
 ```
+
+Step 5 (optional): Pre-build the MSM C kernel.
+
+The C kernel is compiled automatically by `c_kernels/build.py` on the first
+import of `multiscalar_multiplication_context`, so no separate build step is
+required. To pre-build (or force a rebuild) ahead of time:
+```
+python -m c_kernels.build           # build if missing or stale
+python -m c_kernels.build --force   # always rebuild
+```
+The compiler defaults to `g++` with `-std=c++17 -fopenmp -O2 -fPIC -shared`
+plus `-I<jaxlib>/include`. Override via the `CXX` and `CXXFLAGS` env vars
+(e.g. point `CXX` at conda's `gxx_linux-64` to keep the build inside the env).
 
 # 3. TPU Setup
 The code is optimized for TPU execution, but it also runs on NVIDIA GPU and CPU for functional preview (not optimized for these devices).
@@ -145,18 +177,27 @@ After this, you should follow the steps on [link](https://code.visualstudio.com/
 
 # 4. Ready to Play?
 
-Run functional correctness testing for both NTT and MSM.
+Run functional correctness tests for both NTT and MSM:
 ```
 python3 number_theory_transform_test.py
 python3 multiscalar_multiplication_test.py
 ```
 
-Run performance correctness testing for both NTT and MSM.
+Run performance tests for both NTT and MSM:
 
 ```
 python3 number_theory_transform_perf_test.py
 python3 multiscalar_multiplication_perf_test.py
 ```
+
+Notes:
+- The first MSM test run auto-compiles `c_kernels/distribution.cpp` into
+  `c_kernels/distribution.so` (a few seconds). Subsequent runs reuse the cached
+  `.so` and rebuild only when the source is newer.
+- The first run of each test also JIT-compiles JAX kernels; expect a longer
+  first iteration that is then cached under `deployments/`.
+- Performance tests assume the reference data from Step 4 is present under
+  `./data/`.
 
 # 5. Call for Actions
 Our mission is to build an open-sourced SoTA library for the community.

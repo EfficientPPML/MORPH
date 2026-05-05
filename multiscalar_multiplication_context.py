@@ -16,6 +16,7 @@ import utils
 from utils import JaxKernelContextBase, JaxParameters, hash_args, jax_jit_lower_compile, store_jax_executable, load_jax_executable
 from finite_field_context import FiniteFieldContextBase
 from elliptic_curve_context import EllipticCurveContextBase
+from c_kernels.build import ensure_distribution_kernel
 
 jax.config.update("jax_enable_x64", True)
 
@@ -133,7 +134,7 @@ class OldCPUDistributionMSMContext(CPUDistributionMSMContextBase):
     self.ba_input_regular_shape = regular_shape
     self.ba_input_special_shape = special_shape
 
-    lib = ctypes.cdll.LoadLibrary("./c_kernels/distribution.so")
+    lib = ctypes.cdll.LoadLibrary(ensure_distribution_kernel())
     jax.ffi.register_ffi_target("distribute_buf", jax.ffi.pycapsule(lib.DistributeBuf), platform="cpu")
     self.distribution_buf_c_kernel_call = ffi.ffi_call(
         "distribute_buf",
@@ -480,7 +481,7 @@ class CPUDistributionMSMContext(OldCPUDistributionMSMContext, JaxKernelContextBa
     self.ba_input_regular_shape = regular_shape
     self.ba_input_special_shape = special_shape
 
-    lib = ctypes.cdll.LoadLibrary("./c_kernels/distribution.so")
+    lib = ctypes.cdll.LoadLibrary(ensure_distribution_kernel())
     jax.ffi.register_ffi_target("distribute_buf", jax.ffi.pycapsule(lib.DistributeBufZero), platform="cpu")
     self.distribution_buf_c_kernel_call = ffi.ffi_call(
         "distribute_buf",
