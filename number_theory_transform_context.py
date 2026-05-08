@@ -1,9 +1,12 @@
-import numpy as np
+from abc import ABC, abstractmethod
 import jax
 import jax.numpy as jnp
 import utils
-from abc import ABC, abstractmethod
-from finite_field_context import DRNSlazyContext, CROSSLazyContext
+from finite_field_context import (
+    CROSSLazyContext,
+    DRNSlazyContext,
+)
+import numpy as np
 
 jax.config.update("jax_enable_x64", True)
 
@@ -80,7 +83,9 @@ class NumberTheoryTransformBase(ABC):
 ########################
 # BAT (Basis Aligned Transformation) helpers
 ########################
-def basis_aligned_transformation(matrix_drns: np.ndarray, rns_moduli) -> jnp.ndarray:
+def basis_aligned_transformation(
+    matrix_drns: np.ndarray, rns_moduli
+) -> jnp.ndarray:
   """Convert a 2-D DRNS twiddle matrix to BAT format for 8-bit matmul.
 
   Each uint32 value is byte-shifted by 0/8/16/24 bits, reduced mod each
@@ -110,7 +115,9 @@ def basis_aligned_transformation(matrix_drns: np.ndarray, rns_moduli) -> jnp.nda
   return jnp.array(shifted_u8)
 
 
-def matmul_bat_einsum(v: jax.Array, bat_twiddle: jax.Array, subscripts: str) -> jax.Array:
+def matmul_bat_einsum(
+    v: jax.Array, bat_twiddle: jax.Array, subscripts: str
+) -> jax.Array:
   """BAT-based 8-bit matrix multiplication.
 
   Bitcasts the input from uint32 to uint8, performs an 8-bit einsum with
@@ -118,8 +125,8 @@ def matmul_bat_einsum(v: jax.Array, bat_twiddle: jax.Array, subscripts: str) -> 
   byte-shifting.
 
   Args:
-      v: Input array (uint32). The trailing dimension (num_moduli) is
-         expanded to (num_moduli, 4) by bitcast.
+      v: Input array (uint32). The trailing dimension (num_moduli) is expanded
+        to (num_moduli, 4) by bitcast.
       bat_twiddle: BAT twiddle (uint8), pre-computed offline.
       subscripts: Einsum subscript string including the byte dimensions.
 
@@ -128,7 +135,9 @@ def matmul_bat_einsum(v: jax.Array, bat_twiddle: jax.Array, subscripts: str) -> 
   """
   v_u8 = jax.lax.bitcast_convert_type(v, jnp.uint8)
   shift_factors = jnp.array([0, 8, 16, 24], dtype=jnp.uint32)
-  products = jnp.einsum(subscripts, v_u8, bat_twiddle, preferred_element_type=jnp.uint32)
+  products = jnp.einsum(
+      subscripts, v_u8, bat_twiddle, preferred_element_type=jnp.uint32
+  )
   return jnp.sum(products.astype(jnp.uint64) << shift_factors, axis=-1)
 
 
@@ -151,7 +160,7 @@ def _bat_subscripts_right(v_ndim: int, contract_axis: int) -> str:
     contract_axis += v_ndim
   if not (0 <= contract_axis < v_ndim - 1):
     raise ValueError(
-        f"contract_axis must be a leading axis of v "
+        "contract_axis must be a leading axis of v "
         f"(got {contract_axis} for v.ndim={v_ndim})"
     )
   letters = []
@@ -204,9 +213,10 @@ class DRNSLazyExtensionContext(DRNSlazyContext):
     if arr.dtype != object:
       arr = arr.astype(object)
     moduli_obj = np.array(self.rns_moduli, dtype=object)
-    drns_obj = ((arr[..., np.newaxis] % moduli_obj) << self.radix_bits) % moduli_obj
-    drns_jnp = jnp.array(drns_obj.astype(np.uint32))
-    return basis_aligned_transformation(drns_jnp, self.rns_moduli)
+    drns_obj = (
+        (arr[..., np.newaxis] % moduli_obj) << self.radix_bits
+    ) % moduli_obj
+    return basis_aligned_transformation(drns_obj.astype(np.uint32), self.rns_moduli)
 
   def preprocess_elementwise(self, mat_nd) -> jnp.ndarray:
     """Encode an arbitrary-rank integer tensor in DRNS computational form."""
@@ -214,13 +224,16 @@ class DRNSLazyExtensionContext(DRNSlazyContext):
     if arr.dtype != object:
       arr = arr.astype(object)
     moduli_obj = np.array(self.rns_moduli, dtype=object)
-    drns_obj = ((arr[..., np.newaxis] % moduli_obj) << self.radix_bits) % moduli_obj
+    drns_obj = (
+        (arr[..., np.newaxis] % moduli_obj) << self.radix_bits
+    ) % moduli_obj
     return jnp.array(drns_obj.astype(np.uint32))
 
   def modular_matmul(
       self, operand: jax.Array, handle: jax.Array, contract_axis: int
   ) -> jax.Array:
     """Modular matmul contracting ``operand[contract_axis]`` against
+
     ``handle[0]``.  ``handle`` must come from
     :py:meth:`preprocess_matmul`.
     """
@@ -291,6 +304,7 @@ class CROSSLazyExtensionContext(CROSSLazyContext):
       self, operand: jax.Array, handle: jax.Array, contract_axis: int
   ) -> jax.Array:
     """Modular matmul contracting ``operand[contract_axis]`` against
+
     ``handle[0]``.  ``handle`` must come from
     :py:meth:`preprocess_matmul` and is ``(K, J, chunks)``.
     """
@@ -300,7 +314,7 @@ class CROSSLazyExtensionContext(CROSSLazyContext):
       contract_axis += operand.ndim
     if not (0 <= contract_axis < operand.ndim - 1):
       raise ValueError(
-          f"contract_axis must be a leading axis of operand "
+          "contract_axis must be a leading axis of operand "
           f"(got {contract_axis} for operand.ndim={operand.ndim})"
       )
     nc = self.chunk_num_u32
@@ -399,7 +413,9 @@ class NumpyCPUContext:
     out = out % self.prime
     return out[..., np.newaxis]
 
-  def modular_multiply_broadcast(self, a: np.ndarray, b: np.ndarray) -> np.ndarray:
+  def modular_multiply_broadcast(
+      self, a: np.ndarray, b: np.ndarray
+  ) -> np.ndarray:
     """Broadcasting element-wise modular multiply."""
     a_arr = np.asarray(a, dtype=np.uint64)
     b_arr = np.asarray(b, dtype=np.uint64)
@@ -448,7 +464,9 @@ class NTTBase(NumberTheoryTransformBase):
         num_moduli = parameters.get("num_moduli", 21)
         precision_bits = parameters.get("precision_bits", 28)
         radix_bits = parameters.get("radix_bits", 32)
-        rns_moduli = utils.find_moduli_specified_number(num_moduli, precision_bits)
+        rns_moduli = utils.find_moduli_specified_number(
+            num_moduli, precision_bits
+        )
         return DRNSLazyExtensionContext({
             "prime": prime,
             "rns_moduli": rns_moduli,
@@ -506,7 +524,8 @@ class NTT3Step(NTTBase):
     self.transform_length = self.r * self.c
     psi = parameters.get("psi")
     self.psi = (
-        int(psi) if psi is not None
+        int(psi)
+        if psi is not None
         else utils.root_of_unity(2 * self.transform_length, self.prime)
     )
     self.omega = (self.psi**2) % self.prime
@@ -548,14 +567,14 @@ class NTT3Step(NTTBase):
     self.intt_t2 = ff_ctx.preprocess_elementwise(intt_tf2)
     self.intt_t3 = ff_ctx.preprocess_matmul(intt_tf3.T)
 
-  def ntt(self, v: jnp.ndarray) -> jnp.ndarray:
-    v = self._ensure_ntt_shape(v)                                   # (B, R, C, trailing)
+  def ntt(self, v: jnp.ndarray):
+    v = self._ensure_ntt_shape(v)  # (B, R, C, trailing)
     v = self.ff_ctx.modular_matmul(v, self.ntt_t1, contract_axis=1)
     v = self.ff_ctx.modular_multiply_broadcast(v, self.ntt_t2)
     v = self.ff_ctx.modular_matmul(v, self.ntt_t3, contract_axis=2)
     return v
 
-  def intt(self, v: jnp.ndarray) -> jnp.ndarray:
+  def intt(self, v: jnp.ndarray):
     v = self._ensure_ntt_shape(v)
     v = self.ff_ctx.modular_matmul(v, self.intt_t1, contract_axis=2)
     v = self.ff_ctx.modular_multiply_broadcast(v, self.intt_t2)
@@ -578,7 +597,8 @@ class NTT5Step(NTTBase):
     R = self.rr * self.rc
     psi = parameters.get("psi")
     self.psi = (
-        int(psi) if psi is not None
+        int(psi)
+        if psi is not None
         else utils.root_of_unity(2 * self.transform_length, self.prime)
     )
     self.omega = (self.psi**2) % self.prime
@@ -622,30 +642,38 @@ class NTT5Step(NTTBase):
     ntt_T2 = ntt_T2[perm_rr, :]
     ntt_T3 = ntt_T3[:, perm_rc]
     perm_R = get_bit_reverse_perm(R)
-    ntt_T4 = ntt_T4.reshape(R, self.c)[perm_R, :].reshape(self.rr, self.rc, self.c)
+    ntt_T4 = ntt_T4.reshape(R, self.c)[perm_R, :].reshape(
+        self.rr, self.rc, self.c
+    )
     ntt_T5 = ntt_T5[:, perm_c]
 
     intt_T5 = intt_T5[perm_c, :]
-    intt_T4 = intt_T4.reshape(R, self.c)[perm_R, :].reshape(self.rr, self.rc, self.c)
+    intt_T4 = intt_T4.reshape(R, self.c)[perm_R, :].reshape(
+        self.rr, self.rc, self.c
+    )
     intt_T3 = intt_T3[perm_rc, :]
     intt_T2 = intt_T2[perm_rr, :]
     intt_T1 = intt_T1[:, perm_rr]
 
     # Matmul twiddles: transpose when the original step was left-matmul.
-    self.ntt_T1 = ff_ctx.preprocess_matmul(ntt_T1.T)  # left-mat → right via transpose
+    self.ntt_T1 = ff_ctx.preprocess_matmul(
+        ntt_T1.T
+    )  # left-mat → right via transpose
     self.ntt_T2 = ff_ctx.preprocess_elementwise(ntt_T2)  # (RR, RC, trailing)
-    self.ntt_T3 = ff_ctx.preprocess_matmul(ntt_T3)        # right-mat
-    self.ntt_T4 = ff_ctx.preprocess_elementwise(ntt_T4)   # (RR, RC, C, trailing)
-    self.ntt_T5 = ff_ctx.preprocess_matmul(ntt_T5)        # right-mat
+    self.ntt_T3 = ff_ctx.preprocess_matmul(ntt_T3)  # right-mat
+    self.ntt_T4 = ff_ctx.preprocess_elementwise(ntt_T4)  # (RR, RC, C, trailing)
+    self.ntt_T5 = ff_ctx.preprocess_matmul(ntt_T5)  # right-mat
 
     self.intt_T5 = ff_ctx.preprocess_matmul(intt_T5)
     self.intt_T4 = ff_ctx.preprocess_elementwise(intt_T4)
     self.intt_T3 = ff_ctx.preprocess_matmul(intt_T3)
     self.intt_T2 = ff_ctx.preprocess_elementwise(intt_T2)
-    self.intt_T1 = ff_ctx.preprocess_matmul(intt_T1.T)  # undo the step-1 left-mat
+    self.intt_T1 = ff_ctx.preprocess_matmul(
+        intt_T1.T
+    )  # undo the step-1 left-mat
 
-  def ntt(self, v: jnp.ndarray) -> jnp.ndarray:
-    v = self._ensure_ntt_shape(v)                              # (B, RR, RC, C, trailing)
+  def ntt(self, v: jnp.ndarray):
+    v = self._ensure_ntt_shape(v)  # (B, RR, RC, C, trailing)
     v = self.ff_ctx.modular_matmul(v, self.ntt_T1, contract_axis=1)
     v = self.ff_ctx.modular_multiply_broadcast(v, self.ntt_T2[:, :, None, :])
     v = self.ff_ctx.modular_matmul(v, self.ntt_T3, contract_axis=2)
@@ -653,7 +681,7 @@ class NTT5Step(NTTBase):
     v = self.ff_ctx.modular_matmul(v, self.ntt_T5, contract_axis=3)
     return v
 
-  def intt(self, v: jnp.ndarray) -> jnp.ndarray:
+  def intt(self, v: jnp.ndarray):
     v = self._ensure_ntt_shape(v)
     v = self.ff_ctx.modular_matmul(v, self.intt_T5, contract_axis=3)
     v = self.ff_ctx.modular_multiply_broadcast(v, self.intt_T4[None])
@@ -680,7 +708,8 @@ class NTT7Step(NTTBase):
     self.transform_length = R * C
     psi = parameters.get("psi")
     self.psi = (
-        int(psi) if psi is not None
+        int(psi)
+        if psi is not None
         else utils.root_of_unity(2 * self.transform_length, self.prime)
     )
     self.omega = (self.psi**2) % self.prime
@@ -768,8 +797,8 @@ class NTT7Step(NTTBase):
     self.intt_T2 = ff_ctx.preprocess_elementwise(intt_T2)
     self.intt_T1 = ff_ctx.preprocess_matmul(intt_T1.T)
 
-  def ntt(self, v: jnp.ndarray) -> jnp.ndarray:
-    v = self._ensure_ntt_shape(v)                                 # (B, RR, RC, CR, CC, trailing)
+  def ntt(self, v: jnp.ndarray):
+    v = self._ensure_ntt_shape(v)  # (B, RR, RC, CR, CC, trailing)
     # Steps 1-3: inner NTT on R = RR * RC.
     v = self.ff_ctx.modular_matmul(v, self.ntt_T1, contract_axis=1)
     v = self.ff_ctx.modular_multiply_broadcast(
@@ -786,7 +815,7 @@ class NTT7Step(NTTBase):
     v = self.ff_ctx.modular_matmul(v, self.ntt_T7, contract_axis=4)
     return v
 
-  def intt(self, v: jnp.ndarray) -> jnp.ndarray:
+  def intt(self, v: jnp.ndarray):
     v = self._ensure_ntt_shape(v)
     v = self.ff_ctx.modular_matmul(v, self.intt_T7, contract_axis=4)
     v = self.ff_ctx.modular_multiply_broadcast(
@@ -800,4 +829,3 @@ class NTT7Step(NTTBase):
     )
     v = self.ff_ctx.modular_matmul(v, self.intt_T1, contract_axis=1)
     return v
-

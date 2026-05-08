@@ -1,36 +1,58 @@
 import jax
-import finite_field_context as ff_context
+import jax.numpy as jnp
 import number_theory_transform_context as ntt_context
+import utils as utils
+import numpy as np
+
 from absl.testing import absltest
 from absl.testing import parameterized
-
-jax.config.update("jax_enable_x64", True)
-import numpy as np
-import jax.numpy as jnp
-import utils
 
 MODULI = 134219681
 
 # ---------------------------------------------------------------------------
 # Trailing-dimension sizing — change these to sweep field-element width.
 # ---------------------------------------------------------------------------
-NUM_MODULI = 21           # DRNS: number of RNS moduli (trailing dim size), 21 for 256-bit, 56 for 753-bit
-PRECISION_BITS = 28       # DRNS: bit-width per modulus
-RADIX_BITS = 32           # DRNS: Montgomery radix
-CHUNK_NUM_U8 = 32         # CROSS: override chunk_num_u8 (None = auto from prime), 32 for 256-bit, 95 for 753-bit
+NUM_MODULI = 21  # DRNS: number of RNS moduli (trailing dim size), 21 for 256-bit, 56 for 753-bit
+PRECISION_BITS = 28  # DRNS: bit-width per modulus
+RADIX_BITS = 32  # DRNS: Montgomery radix
+CHUNK_NUM_U8 = 32  # CROSS: override chunk_num_u8 (None = auto from prime), 32 for 256-bit, 95 for 753-bit
 
 TEST_VECTOR = {
     "coef_in": [
-        105825732, 68433452, 36629220, 126901109,
-        89469849, 106633716, 15102657, 108374459,
-        68789927, 23451922, 93538050, 20585372,
-        30604976, 37517995, 65644325, 102451383,
+        105825732,
+        68433452,
+        36629220,
+        126901109,
+        89469849,
+        106633716,
+        15102657,
+        108374459,
+        68789927,
+        23451922,
+        93538050,
+        20585372,
+        30604976,
+        37517995,
+        65644325,
+        102451383,
     ],
     "eval_in": [
-        26196696, 45475009, 10055359, 23277424,
-        69041040, 71916973, 73894069, 3311254,
-        44646798, 49882443, 28097016, 70484730,
-        10811958, 11946041, 61318182, 19099272,
+        26196696,
+        45475009,
+        10055359,
+        23277424,
+        69041040,
+        71916973,
+        73894069,
+        3311254,
+        44646798,
+        49882443,
+        28097016,
+        70484730,
+        10811958,
+        11946041,
+        61318182,
+        19099272,
     ],
 }
 
@@ -56,9 +78,14 @@ NTT_7STEP = [make_ntt_case("0", 2, 2, 2, 2)]  # Layout: (rr, rc, cr, cc)
 # Sharded correctness configs: (case_name, spatial_params, ntt_cls, spatial_shape)
 # ---------------------------------------------------------------------------
 SHARDED_CORRECTNESS_CONFIGS = [
-    ("3step", {"r": 4, "c": 4},                       ntt_context.NTT3Step, (4, 4)),
-    ("5step", {"rr": 2, "rc": 2, "c": 4},             ntt_context.NTT5Step, (2, 2, 4)),
-    ("7step", {"rr": 2, "rc": 2, "cr": 2, "cc": 2},   ntt_context.NTT7Step, (2, 2, 2, 2)),
+    ("3step", {"r": 4, "c": 4}, ntt_context.NTT3Step, (4, 4)),
+    ("5step", {"rr": 2, "rc": 2, "c": 4}, ntt_context.NTT5Step, (2, 2, 4)),
+    (
+        "7step",
+        {"rr": 2, "rc": 2, "cr": 2, "cc": 2},
+        ntt_context.NTT7Step,
+        (2, 2, 2, 2),
+    ),
 ]
 
 
@@ -79,7 +106,7 @@ def _create_sharding():
   else:
     mesh_shape = (1, 1)
 
-  mesh = jax.make_mesh(mesh_shape, ('x', 'y'))
+  mesh = jax.make_mesh(mesh_shape, ("x", "y"))
   return mesh, jax.sharding.PartitionSpec
 
 
@@ -113,14 +140,12 @@ class NTTTest(parameterized.TestCase):
   def test_DRNS_NTT_3step(self, q, psi, batch, r, c, coef_in, eval_in):
     """Validate the 3-step NTT with DRNS lazy reduction."""
     rns_moduli = utils.find_moduli_specified_number(NUM_MODULI, PRECISION_BITS)
-    ff_ctx = ntt_context.DRNSLazyExtensionContext(
-        {
-            "prime": q,
-            "rns_moduli": rns_moduli,
-            "precision_bits": PRECISION_BITS,
-            "radix_bits": RADIX_BITS,
-        }
-    )
+    ff_ctx = ntt_context.DRNSLazyExtensionContext({
+        "prime": q,
+        "rns_moduli": rns_moduli,
+        "precision_bits": PRECISION_BITS,
+        "radix_bits": RADIX_BITS,
+    })
     ntt_ctx = ntt_context.NTT3Step(
         {"prime": q, "r": r, "c": c, "finite_field_context": ff_ctx}
     )
@@ -130,25 +155,27 @@ class NTTTest(parameterized.TestCase):
 
     # Forward NTT
     ntt_result = ntt_ctx.ntt(coef_drns)
-    np.testing.assert_array_equal(eval_in, ntt_ctx.to_original_format(ntt_result))
+    np.testing.assert_array_equal(
+        eval_in, ntt_ctx.to_original_format(ntt_result)
+    )
 
     # Inverse NTT
     intt_result = ntt_ctx.intt(ntt_result)
-    np.testing.assert_array_equal(coef_in, ntt_ctx.to_original_format(intt_result))
+    np.testing.assert_array_equal(
+        coef_in, ntt_ctx.to_original_format(intt_result)
+    )
 
   # @absltest.skip("Skip DRNS NTT tests")
   @parameterized.named_parameters(*NTT_5STEP)
   def test_DRNS_NTT_5step(self, q, psi, batch, rr, rc, c, coef_in, eval_in):
     """Validate the 5-step NTT with DRNS lazy reduction."""
     rns_moduli = utils.find_moduli_specified_number(NUM_MODULI, PRECISION_BITS)
-    ff_ctx = ntt_context.DRNSLazyExtensionContext(
-        {
-            "prime": q,
-            "rns_moduli": rns_moduli,
-            "precision_bits": PRECISION_BITS,
-            "radix_bits": RADIX_BITS,
-        }
-    )
+    ff_ctx = ntt_context.DRNSLazyExtensionContext({
+        "prime": q,
+        "rns_moduli": rns_moduli,
+        "precision_bits": PRECISION_BITS,
+        "radix_bits": RADIX_BITS,
+    })
     ntt_ctx = ntt_context.NTT5Step(
         {"prime": q, "rr": rr, "rc": rc, "c": c, "finite_field_context": ff_ctx}
     )
@@ -158,39 +185,51 @@ class NTTTest(parameterized.TestCase):
 
     # Forward NTT
     ntt_result = ntt_ctx.ntt(coef_drns)
-    np.testing.assert_array_equal(eval_in, ntt_ctx.to_original_format(ntt_result))
+    np.testing.assert_array_equal(
+        eval_in, ntt_ctx.to_original_format(ntt_result)
+    )
 
     # Inverse NTT
     intt_result = ntt_ctx.intt(ntt_result)
-    np.testing.assert_array_equal(coef_in, ntt_ctx.to_original_format(intt_result))
-
+    np.testing.assert_array_equal(
+        coef_in, ntt_ctx.to_original_format(intt_result)
+    )
 
   # @absltest.skip("Skip DRNS NTT tests")
   @parameterized.named_parameters(*NTT_7STEP)
-  def test_DRNS_NTT_7step(self, q, psi, batch, rr, rc, cr, cc, coef_in, eval_in):
+  def test_DRNS_NTT_7step(
+      self, q, psi, batch, rr, rc, cr, cc, coef_in, eval_in
+  ):
     """Validate the 7-step NTT with DRNS lazy reduction."""
     rns_moduli = utils.find_moduli_specified_number(NUM_MODULI, PRECISION_BITS)
-    ff_ctx = ntt_context.DRNSLazyExtensionContext(
-        {
-            "prime": q,
-            "rns_moduli": rns_moduli,
-            "precision_bits": PRECISION_BITS,
-            "radix_bits": RADIX_BITS,
-        }
-    )
-    ntt_ctx = ntt_context.NTT7Step(
-        {"prime": q, "rr": rr, "rc": rc, "cr": cr, "cc": cc, "finite_field_context": ff_ctx}
-    )
+    ff_ctx = ntt_context.DRNSLazyExtensionContext({
+        "prime": q,
+        "rns_moduli": rns_moduli,
+        "precision_bits": PRECISION_BITS,
+        "radix_bits": RADIX_BITS,
+    })
+    ntt_ctx = ntt_context.NTT7Step({
+        "prime": q,
+        "rr": rr,
+        "rc": rc,
+        "cr": cr,
+        "cc": cc,
+        "finite_field_context": ff_ctx,
+    })
 
     coef_drns = ntt_ctx.to_computational_format(coef_in)
 
     # Forward NTT
     ntt_result = ntt_ctx.ntt(coef_drns)
-    np.testing.assert_array_equal(eval_in, ntt_ctx.to_original_format(ntt_result))
+    np.testing.assert_array_equal(
+        eval_in, ntt_ctx.to_original_format(ntt_result)
+    )
 
     # Inverse NTT
     intt_result = ntt_ctx.intt(ntt_result)
-    np.testing.assert_array_equal(coef_in, ntt_ctx.to_original_format(intt_result))
+    np.testing.assert_array_equal(
+        coef_in, ntt_ctx.to_original_format(intt_result)
+    )
 
   # @absltest.skip("Skip CROSS NTT tests")
   @parameterized.named_parameters(*NTT_3STEP)
@@ -207,10 +246,14 @@ class NTTTest(parameterized.TestCase):
     coef_cross = ntt_ctx.to_computational_format(coef_in)
 
     ntt_result = ntt_ctx.ntt(coef_cross)
-    np.testing.assert_array_equal(eval_in, ntt_ctx.to_original_format(ntt_result))
+    np.testing.assert_array_equal(
+        eval_in, ntt_ctx.to_original_format(ntt_result)
+    )
 
     intt_result = ntt_ctx.intt(ntt_result)
-    np.testing.assert_array_equal(coef_in, ntt_ctx.to_original_format(intt_result))
+    np.testing.assert_array_equal(
+        coef_in, ntt_ctx.to_original_format(intt_result)
+    )
 
   # @absltest.skip("Skip CROSS NTT tests")
   @parameterized.named_parameters(*NTT_5STEP)
@@ -227,31 +270,45 @@ class NTTTest(parameterized.TestCase):
     coef_cross = ntt_ctx.to_computational_format(coef_in)
 
     ntt_result = ntt_ctx.ntt(coef_cross)
-    np.testing.assert_array_equal(eval_in, ntt_ctx.to_original_format(ntt_result))
+    np.testing.assert_array_equal(
+        eval_in, ntt_ctx.to_original_format(ntt_result)
+    )
 
     intt_result = ntt_ctx.intt(ntt_result)
-    np.testing.assert_array_equal(coef_in, ntt_ctx.to_original_format(intt_result))
+    np.testing.assert_array_equal(
+        coef_in, ntt_ctx.to_original_format(intt_result)
+    )
 
   # @absltest.skip("Skip CROSS NTT tests")
   @parameterized.named_parameters(*NTT_7STEP)
-  def test_CROSS_NTT_7step(self, q, psi, batch, rr, rc, cr, cc, coef_in, eval_in):
+  def test_CROSS_NTT_7step(
+      self, q, psi, batch, rr, rc, cr, cc, coef_in, eval_in
+  ):
     """Validate the 7-step NTT with CROSS lazy matrix reduction."""
     cross_params = {"prime": q}
     if CHUNK_NUM_U8 is not None:
       cross_params["chunk_num_u8"] = CHUNK_NUM_U8
     ff_ctx = ntt_context.CROSSLazyExtensionContext(cross_params)
-    ntt_ctx = ntt_context.NTT7Step(
-        {"prime": q, "rr": rr, "rc": rc, "cr": cr, "cc": cc, "finite_field_context": ff_ctx}
-    )
+    ntt_ctx = ntt_context.NTT7Step({
+        "prime": q,
+        "rr": rr,
+        "rc": rc,
+        "cr": cr,
+        "cc": cc,
+        "finite_field_context": ff_ctx,
+    })
 
     coef_cross = ntt_ctx.to_computational_format(coef_in)
 
     ntt_result = ntt_ctx.ntt(coef_cross)
-    np.testing.assert_array_equal(eval_in, ntt_ctx.to_original_format(ntt_result))
+    np.testing.assert_array_equal(
+        eval_in, ntt_ctx.to_original_format(ntt_result)
+    )
 
     intt_result = ntt_ctx.intt(ntt_result)
-    np.testing.assert_array_equal(coef_in, ntt_ctx.to_original_format(intt_result))
-
+    np.testing.assert_array_equal(
+        coef_in, ntt_ctx.to_original_format(intt_result)
+    )
 
   # ---------------------------------------------------------------------
   # Unified NTT + NumpyCPUContext parity tests: NTT{3,5,7}Step with a
@@ -267,9 +324,13 @@ class NTTTest(parameterized.TestCase):
     )
     coef_cpu = ntt_ctx.to_computational_format(coef_in)
     ntt_result = ntt_ctx.ntt(coef_cpu)
-    np.testing.assert_array_equal(eval_in, ntt_ctx.to_original_format(ntt_result))
+    np.testing.assert_array_equal(
+        eval_in, ntt_ctx.to_original_format(ntt_result)
+    )
     intt_result = ntt_ctx.intt(ntt_result)
-    np.testing.assert_array_equal(coef_in, ntt_ctx.to_original_format(intt_result))
+    np.testing.assert_array_equal(
+        coef_in, ntt_ctx.to_original_format(intt_result)
+    )
 
   # @absltest.skip("Skip NumpyCPU NTT tests")
   @parameterized.named_parameters(*NTT_5STEP)
@@ -280,23 +341,37 @@ class NTTTest(parameterized.TestCase):
     )
     coef_cpu = ntt_ctx.to_computational_format(coef_in)
     ntt_result = ntt_ctx.ntt(coef_cpu)
-    np.testing.assert_array_equal(eval_in, ntt_ctx.to_original_format(ntt_result))
+    np.testing.assert_array_equal(
+        eval_in, ntt_ctx.to_original_format(ntt_result)
+    )
     intt_result = ntt_ctx.intt(ntt_result)
-    np.testing.assert_array_equal(coef_in, ntt_ctx.to_original_format(intt_result))
+    np.testing.assert_array_equal(
+        coef_in, ntt_ctx.to_original_format(intt_result)
+    )
 
   # @absltest.skip("Skip NumpyCPU NTT tests")
   @parameterized.named_parameters(*NTT_7STEP)
-  def test_NumpyCPU_NTT_7step(self, q, psi, batch, rr, rc, cr, cc, coef_in, eval_in):
+  def test_NumpyCPU_NTT_7step(
+      self, q, psi, batch, rr, rc, cr, cc, coef_in, eval_in
+  ):
     ff_ctx = ntt_context.NumpyCPUContext({"prime": q})
-    ntt_ctx = ntt_context.NTT7Step(
-        {"prime": q, "rr": rr, "rc": rc, "cr": cr, "cc": cc,
-         "finite_field_context": ff_ctx}
-    )
+    ntt_ctx = ntt_context.NTT7Step({
+        "prime": q,
+        "rr": rr,
+        "rc": rc,
+        "cr": cr,
+        "cc": cc,
+        "finite_field_context": ff_ctx,
+    })
     coef_cpu = ntt_ctx.to_computational_format(coef_in)
     ntt_result = ntt_ctx.ntt(coef_cpu)
-    np.testing.assert_array_equal(eval_in, ntt_ctx.to_original_format(ntt_result))
+    np.testing.assert_array_equal(
+        eval_in, ntt_ctx.to_original_format(ntt_result)
+    )
     intt_result = ntt_ctx.intt(ntt_result)
-    np.testing.assert_array_equal(coef_in, ntt_ctx.to_original_format(intt_result))
+    np.testing.assert_array_equal(
+        coef_in, ntt_ctx.to_original_format(intt_result)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -309,7 +384,9 @@ class NTTShardedCorrectnessTest(parameterized.TestCase):
 
   # @absltest.skip("Skip DRNS NTT correctness tests")
   @parameterized.named_parameters(*SHARDED_CORRECTNESS_CONFIGS)
-  def test_sharded_ntt_correctness(self, spatial_params, ctx_cls, spatial_shape):
+  def test_sharded_ntt_correctness(
+      self, spatial_params, ctx_cls, spatial_shape
+  ):
     coef_in = TEST_VECTOR["coef_in"]
     eval_in = TEST_VECTOR["eval_in"]
     ff_ctx = _create_drns_ff_ctx(MODULI)
@@ -332,7 +409,8 @@ class NTTShardedCorrectnessTest(parameterized.TestCase):
     ntt_host = np.asarray(ntt_result)
     for i in range(shard_batch):
       np.testing.assert_array_equal(
-          eval_in, ntt_ctx.to_original_format(ntt_host[i]),
+          eval_in,
+          ntt_ctx.to_original_format(ntt_host[i]),
           err_msg=f"NTT mismatch at batch index {i}",
       )
 
@@ -340,7 +418,8 @@ class NTTShardedCorrectnessTest(parameterized.TestCase):
     intt_host = np.asarray(intt_result)
     for i in range(shard_batch):
       np.testing.assert_array_equal(
-          coef_in, ntt_ctx.to_original_format(intt_host[i]),
+          coef_in,
+          ntt_ctx.to_original_format(intt_host[i]),
           err_msg=f"INTT mismatch at batch index {i}",
       )
 

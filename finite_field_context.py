@@ -1,13 +1,19 @@
-import math
-import logging
-from typing import Union
 from abc import ABC, abstractmethod
-import numpy as np
+import math
+from typing import Any, List, Union
 import warnings
 import jax
 import jax.numpy as jnp
 import utils
-from utils import JaxKernelContextBase, JaxParameters, hash_args, pad_jax_array, store_jax_executable, load_jax_executable, jax_jit_lower_compile
+import numpy as np
+
+JaxKernelContextBase = utils.JaxKernelContextBase
+JaxParameters = utils.JaxParameters
+hash_args = utils.hash_args
+jax_jit_lower_compile = utils.jax_jit_lower_compile
+load_jax_executable = utils.load_jax_executable
+pad_jax_array = utils.pad_jax_array
+store_jax_executable = utils.store_jax_executable
 
 jax.config.update("jax_enable_x64", True)
 
@@ -18,6 +24,11 @@ class FiniteFieldContextBase(ABC):
   Subclasses must implement all abstract methods to provide concrete
   finite field arithmetic operations.
   """
+
+  prime: Any = None
+  parameters: Any = None
+  rns_moduli: Any = None
+  radix_bits: Any = None
 
   @abstractmethod
   def __init__(self, parameters: dict):
@@ -42,8 +53,23 @@ class FiniteFieldContextBase(ABC):
     """
     pass
 
+  def _modular_multiply(self, a: jnp.ndarray, b: jnp.ndarray) -> jnp.ndarray:
+    return a
+
+  def _modular_add(self, a: jnp.ndarray, b: jnp.ndarray) -> jnp.ndarray:
+    return a
+
+  def _modular_subtract(self, a: jnp.ndarray, b: jnp.ndarray) -> jnp.ndarray:
+    return a
+
+  def _modular_negate(self, a: jnp.ndarray) -> jnp.ndarray:
+    return a
+
+  def _modular_reduce(self, a: jnp.ndarray) -> jnp.ndarray:
+    return a
+
   @abstractmethod
-  def to_original_format(self, a) -> jnp.ndarray:
+  def to_original_format(self, a) -> Union[int, List[Any]]:
     """Convert from computational format back to standard representation.
 
     Args:
@@ -52,6 +78,10 @@ class FiniteFieldContextBase(ABC):
     Returns:
         Value in standard integer representation.
     """
+    pass
+
+  @abstractmethod
+  def context_hash(self) -> str:
     pass
 
   @abstractmethod
@@ -125,8 +155,12 @@ class RNSContextBase(FiniteFieldContextBase):
     self.rns_moduli = parameters.get("rns_moduli", [])
     assert len(self.rns_moduli) != 0, "rns_moduli must be non-empty"
     self.total_modulus = math.prod(self.rns_moduli)
-    assert self.total_modulus > self.prime, "RNS total modulus must be greater than prime"
-    self.precision_bits = parameters.get("precision_bits", 0)  # Default precision bits
+    assert (
+        self.total_modulus > self.prime
+    ), "RNS total modulus must be greater than prime"
+    self.precision_bits = parameters.get(
+        "precision_bits", 0
+    )  # Default precision bits
     assert self.precision_bits != 0, "precision bits must be non-zero"
 
     self.crt_factors = self._compute_crt_factors(self.rns_moduli)
@@ -137,7 +171,8 @@ class RNSContextBase(FiniteFieldContextBase):
     sum_moduli_bits = math.ceil(math.log2(sum(self.rns_moduli)))
     if self.precision_bits < sum_moduli_bits:
       warnings.warn(
-          f"precision_bits is less than sum of moduli_bits, precision_bits: {self.precision_bits}, sum of moduli_bits: {sum_moduli_bits}."
+          "precision_bits is less than sum of moduli_bits, precision_bits:"
+          f" {self.precision_bits}, sum of moduli_bits: {sum_moduli_bits}."
           + "This may cause precision loss.",
           UserWarning,
           stacklevel=2,
@@ -147,7 +182,8 @@ class RNSContextBase(FiniteFieldContextBase):
     required_precision = max_modulus_bits + math.log2(len(self.rns_moduli)) + 1
     if self.precision_bits < required_precision:
       warnings.warn(
-          f"precision_bits is less than required precision, precision_bits: {self.precision_bits}, required precision: {required_precision}."
+          "precision_bits is less than required precision, precision_bits:"
+          f" {self.precision_bits}, required precision: {required_precision}."
           + "This may cause precision loss.",
           UserWarning,
           stacklevel=2,
@@ -155,8 +191,12 @@ class RNSContextBase(FiniteFieldContextBase):
 
   def _compute_crt_factors(self, moduli: list[int]):
     ms = [self.total_modulus // m for m in moduli]
-    ms_inv = [utils.modular_inverse(ms[i], moduli[i]) for i in range(len(moduli))]
-    return [(ms[i] * ms_inv[i]) % self.total_modulus for i in range(len(moduli))]
+    ms_inv = [
+        utils.modular_inverse(ms[i], moduli[i]) for i in range(len(moduli))
+    ]
+    return [
+        (ms[i] * ms_inv[i]) % self.total_modulus for i in range(len(moduli))
+    ]
 
   def _elementwise_add(self, a: list[int], b: list[int]):
     assert len(a) == len(b), "a and b must have the same length"
@@ -223,8 +263,7 @@ class RNSContextBase(FiniteFieldContextBase):
       moduli: list[int],
       u: int,
   ):
-    """
-    CRNS Computation based on Algorithm steps 9-12
+    """CRNS Computation based on Algorithm steps 9-12
 
     Args:
         x: Input vector x_M in RNS representation
@@ -267,17 +306,24 @@ class DRNSlazyContextBase(RNSContextBase):
     super().__init__(parameters)
     self.radix_bits = parameters.get("radix_bits", 0)
     assert self.radix_bits != 0, " radix bits must be non-zero"
-    self.moduli_inv_on_radix = [utils.modular_inverse(m, 1 << self.radix_bits) for m in self.rns_moduli]
+    self.moduli_inv_on_radix = [
+        utils.modular_inverse(m, 1 << self.radix_bits) for m in self.rns_moduli
+    ]
     self.crns_y, self.crns_z = self._precompute_crns_parameters()
     self.matrix_E, self.vector_f_T, self.vector_g = self._crns_precompute(
-        self.rns_moduli, self.prime, self.crns_y, self.crns_z, self.precision_bits
+        self.rns_moduli,
+        self.prime,
+        self.crns_y,
+        self.crns_z,
+        self.precision_bits,
     )
 
   def _check_parameters(self):
     pass  # disable the warning for now
     if (self.prime << self.w) > self.total_modulus:
       warnings.warn(
-          f"Total modulus is not enough to hold prime in DRNSlazy, total modulus: {self.total_modulus}, prime: {self.prime}."
+          "Total modulus is not enough to hold prime in DRNSlazy, total"
+          f" modulus: {self.total_modulus}, prime: {self.prime}."
           + "This may cause finite field overflow.",
           UserWarning,
           stacklevel=2,
@@ -324,14 +370,18 @@ class DRNSlazyContextBase(RNSContextBase):
 
     return matrix_E, vector_f_T, vector_g
 
-  def _elementwise_montgomery_reduce(self, z: list[int], m: list[int], m_inv: list[int]):
+  def _elementwise_montgomery_reduce(
+      self, z: list[int], m: list[int], m_inv: list[int]
+  ):
     assert len(z) == len(m), "z and m must have the same length"
     assert len(z) == len(m_inv), "z and m_inv must have the same length"
     mask = (1 << self.radix_bits) - 1
     z_low = self._elementwise_and(z, mask)
     z_high = self._elementwise_right_shift(z, self.radix_bits)
     q = self._elementwise_and(self._elementwise_multiply(z_low, m_inv), mask)
-    h = self._elementwise_right_shift(self._elementwise_multiply(q, m), self.radix_bits)
+    h = self._elementwise_right_shift(
+        self._elementwise_multiply(q, m), self.radix_bits
+    )
     t = self._elementwise_subtract(z_high, h)
     t = self._elementwise_add(t, m)
     return t
@@ -358,17 +408,23 @@ class DRNSlazyContext(DRNSlazyContextBase, JaxKernelContextBase):
       return [recursive_convert(a_i) for a_i in a]
 
     converted_list = recursive_convert(a)
-    converted_a = jnp.array(np.array(converted_list, dtype=np.uint32), dtype=jnp.uint32)
+    converted_a = jnp.array(
+        np.array(converted_list, dtype=np.uint32), dtype=jnp.uint32
+    )
     if self.use_sharding:
-      named_sharding, padded_shape = self.create_named_sharding(shape=converted_a.shape, axes=[0])
+      named_sharding, padded_shape = self.create_named_sharding(
+          shape=converted_a.shape, axes=[0]
+      )
       converted_a = pad_jax_array(converted_a, padded_shape)
       return converted_a.to_device(named_sharding)
     else:
       return converted_a.to_device(jax.devices()[0])
 
-  def to_original_format(self, a: jnp.ndarray) -> Union[int, list]:
+  def to_original_format(self, a: jnp.ndarray) -> Union[int, list]:  # type: ignore
     def individual_convert(a: list[int]) -> int:
-      a = self._elementwise_montgomery_reduce(a, self.rns_moduli, self.moduli_inv_on_radix)
+      a = self._elementwise_montgomery_reduce(
+          a, self.rns_moduli, self.moduli_inv_on_radix
+      )
       r = 0
       for i in range(len(a)):
         r = (r + a[i] * self.crt_factors[i]) % self.total_modulus
@@ -381,16 +437,31 @@ class DRNSlazyContext(DRNSlazyContextBase, JaxKernelContextBase):
 
     return recursive_convert(a)
 
-  def _get_shape_dtype_structs(self, parameters: dict) -> list[jax.ShapeDtypeStruct]:
+  def _get_shape_dtype_structs(
+      self, parameters: dict
+  ) -> list[jax.ShapeDtypeStruct]:
     batch_shape = parameters["batch_shape"]
     oprand_shape = batch_shape + (len(self.rns_moduli),)
     if self.use_sharding:
-      named_sharding, padded_shape = self.create_named_sharding(shape=oprand_shape, axes=[0])
-      return [jax.ShapeDtypeStruct(padded_shape, jnp.uint32, sharding=named_sharding)]
+      named_sharding, padded_shape = self.create_named_sharding(
+          shape=oprand_shape, axes=[0]
+      )
+      return [
+          jax.ShapeDtypeStruct(
+              padded_shape, jnp.uint32, sharding=named_sharding
+          )
+      ]
     return [jax.ShapeDtypeStruct(oprand_shape, jnp.uint32)]
 
   def context_hash(self) -> str:
-    return hash_args(self.__class__.__name__, self.prime, self.rns_moduli, self.precision_bits, self.radix_bits, self.use_sharding)
+    return hash_args(
+        self.__class__.__name__,
+        self.prime,
+        self.rns_moduli,
+        self.precision_bits,
+        self.radix_bits,
+        self.use_sharding,
+    )
 
   def serialize(self, parameters: dict):
     shape_dtype_structs = self._get_shape_dtype_structs(parameters)
@@ -416,10 +487,14 @@ class DRNSlazyContext(DRNSlazyContextBase, JaxKernelContextBase):
         name=f"{class_name}_modular_subtract_{kernel_hash}",
     )
     store_jax_executable(
-        self._modular_reduce, shape_dtype_structs[0], name=f"{class_name}_modular_reduce_{kernel_hash}"
+        self._modular_reduce,
+        shape_dtype_structs[0],
+        name=f"{class_name}_modular_reduce_{kernel_hash}",
     )
     store_jax_executable(
-        self._modular_negate, shape_dtype_structs[0], name=f"{class_name}_modular_negate_{kernel_hash}"
+        self._modular_negate,
+        shape_dtype_structs[0],
+        name=f"{class_name}_modular_negate_{kernel_hash}",
     )
 
   def compile(self, parameters: dict):
@@ -427,11 +502,21 @@ class DRNSlazyContext(DRNSlazyContextBase, JaxKernelContextBase):
     kernel_hash = hash_args(self.context_hash(), parameters)
     class_name = self.__class__.__name__
 
-    modular_multiply_kernel = load_jax_executable(f"{class_name}_modular_multiply_{kernel_hash}")
-    modular_add_kernel = load_jax_executable(f"{class_name}_modular_add_{kernel_hash}")
-    modular_subtract_kernel = load_jax_executable(f"{class_name}_modular_subtract_{kernel_hash}")
-    modular_reduce_kernel = load_jax_executable(f"{class_name}_modular_reduce_{kernel_hash}")
-    modular_negate_kernel = load_jax_executable(f"{class_name}_modular_negate_{kernel_hash}")
+    modular_multiply_kernel = load_jax_executable(
+        f"{class_name}_modular_multiply_{kernel_hash}"
+    )
+    modular_add_kernel = load_jax_executable(
+        f"{class_name}_modular_add_{kernel_hash}"
+    )
+    modular_subtract_kernel = load_jax_executable(
+        f"{class_name}_modular_subtract_{kernel_hash}"
+    )
+    modular_reduce_kernel = load_jax_executable(
+        f"{class_name}_modular_reduce_{kernel_hash}"
+    )
+    modular_negate_kernel = load_jax_executable(
+        f"{class_name}_modular_negate_{kernel_hash}"
+    )
 
     if None in [
         modular_multiply_kernel,
@@ -441,38 +526,75 @@ class DRNSlazyContext(DRNSlazyContextBase, JaxKernelContextBase):
         modular_negate_kernel,
     ]:
       # if not self.use_sharding:
-        warnings.warn(f"Not found stored serialized compiled kernels, compiling...", UserWarning, stacklevel=2)
+      warnings.warn(
+          f"Not found stored serialized compiled kernels, compiling...",
+          UserWarning,
+          stacklevel=2,
+      )
 
-    kernel_hash = hash_args(shape_dtype_structs[0].shape, shape_dtype_structs[0].dtype.__str__())
+    kernel_hash = hash_args(
+        shape_dtype_structs[0].shape, shape_dtype_structs[0].dtype.__str__()
+    )
     # print(f"kernel_hash: {kernel_hash}")
 
     self.compiled_kernels[kernel_hash] = {
-        "modular_multiply": modular_multiply_kernel
-        if modular_multiply_kernel is not None
-        else jax_jit_lower_compile(self._modular_multiply, shape_dtype_structs[0], shape_dtype_structs[0]),
-        "modular_add": modular_add_kernel
-        if modular_add_kernel is not None
-        else jax_jit_lower_compile(self._modular_add, shape_dtype_structs[0], shape_dtype_structs[0]),
-        "modular_subtract": modular_subtract_kernel
-        if modular_subtract_kernel is not None
-        else jax_jit_lower_compile(self._modular_subtract, shape_dtype_structs[0], shape_dtype_structs[0]),
-        "modular_reduce": modular_reduce_kernel
-        if modular_reduce_kernel is not None
-        else jax_jit_lower_compile(self._modular_reduce, shape_dtype_structs[0]),
-        "modular_negate": modular_negate_kernel
-        if modular_negate_kernel is not None
-        else jax_jit_lower_compile(self._modular_negate, shape_dtype_structs[0]),
+        "modular_multiply": (
+            modular_multiply_kernel
+            if modular_multiply_kernel is not None
+            else jax_jit_lower_compile(
+                self._modular_multiply,
+                shape_dtype_structs[0],
+                shape_dtype_structs[0],
+            )
+        ),
+        "modular_add": (
+            modular_add_kernel
+            if modular_add_kernel is not None
+            else jax_jit_lower_compile(
+                self._modular_add,
+                shape_dtype_structs[0],
+                shape_dtype_structs[0],
+            )
+        ),
+        "modular_subtract": (
+            modular_subtract_kernel
+            if modular_subtract_kernel is not None
+            else jax_jit_lower_compile(
+                self._modular_subtract,
+                shape_dtype_structs[0],
+                shape_dtype_structs[0],
+            )
+        ),
+        "modular_reduce": (
+            modular_reduce_kernel
+            if modular_reduce_kernel is not None
+            else jax_jit_lower_compile(
+                self._modular_reduce, shape_dtype_structs[0]
+            )
+        ),
+        "modular_negate": (
+            modular_negate_kernel
+            if modular_negate_kernel is not None
+            else jax_jit_lower_compile(
+                self._modular_negate, shape_dtype_structs[0]
+            )
+        ),
     }
     self.use_compiled_kernels = True
 
-  def _jax_crns_precompute(self, moduli: list[int], prime: int, y: int, z: int, u: int):
+  def _jax_crns_precompute(
+      self, moduli: list[int], prime: int, y: int, z: int, u: int
+  ):
     rns_moduli_bytes = 4
     vector_I = self._get_crns_vector_I_before_reducing(moduli, y)
     modular = math.prod(moduli)
 
     vector_I_byteshifted = []
     for value_i in vector_I:
-      value_i_byteshifted = [(value_i << (8 * byte_idx)) % modular for byte_idx in range(rns_moduli_bytes)]
+      value_i_byteshifted = [
+          (value_i << (8 * byte_idx)) % modular
+          for byte_idx in range(rns_moduli_bytes)
+      ]
       vector_I_byteshifted = vector_I_byteshifted + value_i_byteshifted
 
     matrix_E = []
@@ -485,7 +607,9 @@ class DRNSlazyContext(DRNSlazyContextBase, JaxKernelContextBase):
 
     vector_f = []
     for value_i_byteshifted in vector_I_byteshifted:
-      value_i_byteshifted_f = math.ceil((value_i_byteshifted * (1 << u)) / modular)
+      value_i_byteshifted_f = math.ceil(
+          (value_i_byteshifted * (1 << u)) / modular
+      )
       vector_f.append(value_i_byteshifted_f)
     vector_f_T_np = np.array(vector_f, dtype=np.uint32).reshape(-1, 1)
     vector_f_T_np_u8 = vector_f_T_np.view(np.uint8)
@@ -506,13 +630,21 @@ class DRNSlazyContext(DRNSlazyContextBase, JaxKernelContextBase):
     word_mask = (1 << word_bits) - 1
     rns_moduli_low = [m & half_word_mask for m in self.rns_moduli]
     rns_moduli_high = [m >> half_word_bits for m in self.rns_moduli]
-    rns_moduli_inv_word = [utils.modular_inverse(m, 2**word_bits) for m in self.rns_moduli]
+    rns_moduli_inv_word = [
+        utils.modular_inverse(m, 2**word_bits) for m in self.rns_moduli
+    ]
     crns_precision = self.precision_bits
     crns_matrix_E_with_f_T, crns_vector_g = self._jax_crns_precompute(
-        self.rns_moduli, self.prime, self.crns_y, self.crns_z, self.precision_bits
+        self.rns_moduli,
+        self.prime,
+        self.crns_y,
+        self.crns_z,
+        self.precision_bits,
     )
     num_moduli = len(self.rns_moduli)
-    moduli_sub = self.to_computational_format(256 * num_moduli * 4 * 2 * self.prime)
+    moduli_sub = self.to_computational_format(
+        256 * num_moduli * 4 * 2 * self.prime
+    )
 
     self.jax_parameters.set_parameter(
         word_mask=word_mask,
@@ -524,7 +656,9 @@ class DRNSlazyContext(DRNSlazyContextBase, JaxKernelContextBase):
         rns_moduli_high=jnp.array(rns_moduli_high, dtype=jnp.uint16),
         rns_moduli_inv_word=jnp.array(rns_moduli_inv_word, dtype=jnp.uint32),
         crns_precision=jnp.array(crns_precision, dtype=jnp.uint32),
-        crns_stacked_mat_E_with_f_T=jnp.array(crns_matrix_E_with_f_T, dtype=jnp.uint8),
+        crns_stacked_mat_E_with_f_T=jnp.array(
+            crns_matrix_E_with_f_T, dtype=jnp.uint8
+        ),
         crns_vector_g=jnp.array(crns_vector_g, dtype=jnp.uint32),
         rns_moduli_sub=jnp.array(moduli_sub, dtype=jnp.uint32),
         rns_moduli_negate=jnp.array(self.rns_moduli, dtype=jnp.uint32),
@@ -535,14 +669,26 @@ class DRNSlazyContext(DRNSlazyContextBase, JaxKernelContextBase):
     # Computation
     z_low = z.astype(jnp.uint32)
     z_high = (z >> self.jax_parameters.word_bits).astype(jnp.uint32)
-    t = (z_low * self.jax_parameters.rns_moduli_inv_word) & self.jax_parameters.word_mask
+    t = (
+        z_low * self.jax_parameters.rns_moduli_inv_word
+    ) & self.jax_parameters.word_mask
     t_low = t & self.jax_parameters.half_word_mask
-    t_high = (t >> self.jax_parameters.half_word_bits) & self.jax_parameters.half_word_mask
+    t_high = (
+        t >> self.jax_parameters.half_word_bits
+    ) & self.jax_parameters.half_word_mask
 
-    prod_high = t_high * self.jax_parameters.rns_moduli_high  # This contributes directly to upper 32 bits
-    prod_mid_high = t_high * self.jax_parameters.rns_moduli_low  # Upper 16 bits go to upper 32 bits
-    prod_mid_low = t_low * self.jax_parameters.rns_moduli_high  # Upper 16 bits go to upper 32 bits
-    prod_low = t_low * self.jax_parameters.rns_moduli_low  # Upper 16 bits contribute to middle part
+    prod_high = (
+        t_high * self.jax_parameters.rns_moduli_high
+    )  # This contributes directly to upper 32 bits
+    prod_mid_high = (
+        t_high * self.jax_parameters.rns_moduli_low
+    )  # Upper 16 bits go to upper 32 bits
+    prod_mid_low = (
+        t_low * self.jax_parameters.rns_moduli_high
+    )  # Upper 16 bits go to upper 32 bits
+    prod_low = (
+        t_low * self.jax_parameters.rns_moduli_low
+    )  # Upper 16 bits contribute to middle part
     mid_low = (
         (prod_mid_high & self.jax_parameters.half_word_mask)
         + (prod_mid_low & self.jax_parameters.half_word_mask)
@@ -561,7 +707,9 @@ class DRNSlazyContext(DRNSlazyContextBase, JaxKernelContextBase):
 
   def _jax_crns(self, z: jax.Array) -> jax.Array:
     shift_factors = jnp.array([0, 8, 16, 24], dtype=jnp.uint64)
-    precision_mask = jnp.array((1 << self.jax_parameters.crns_precision) - 1, dtype=jnp.uint32)
+    precision_mask = jnp.array(
+        (1 << self.jax_parameters.crns_precision) - 1, dtype=jnp.uint32
+    )
     num_moduli_n = self.jax_parameters.crns_vector_g.shape[1]
 
     einsum_subscripts = "...kq,kqnp->...np"
@@ -570,11 +718,18 @@ class DRNSlazyContext(DRNSlazyContextBase, JaxKernelContextBase):
 
     # x_reconstruction_with_v = jnp.matmul(x_u8, stacked_mat_E_with_f_T, preferred_element_type=jnp.uint32)
     x_reconstruction_with_v = jnp.einsum(
-        einsum_subscripts, x_u8, self.jax_parameters.crns_stacked_mat_E_with_f_T, preferred_element_type=jnp.uint32
+        einsum_subscripts,
+        x_u8,
+        self.jax_parameters.crns_stacked_mat_E_with_f_T,
+        preferred_element_type=jnp.uint32,
     )
-    x_reconstruction_with_v_u64 = jnp.sum(x_reconstruction_with_v.astype(jnp.uint64) << shift_factors, axis=(-1,))
+    x_reconstruction_with_v_u64 = jnp.sum(
+        x_reconstruction_with_v.astype(jnp.uint64) << shift_factors, axis=(-1,)
+    )
 
-    x_n, vector_v = jnp.split(x_reconstruction_with_v_u64, [num_moduli_n], axis=-1)
+    x_n, vector_v = jnp.split(
+        x_reconstruction_with_v_u64, [num_moduli_n], axis=-1
+    )
     vector_v = (vector_v >> self.jax_parameters.crns_precision) & precision_mask
 
     x_n = x_n + jnp.multiply(vector_v, self.jax_parameters.crns_vector_g)
@@ -583,8 +738,12 @@ class DRNSlazyContext(DRNSlazyContextBase, JaxKernelContextBase):
   def _modular_multiply(self, a: jnp.ndarray, b: jnp.ndarray) -> jnp.ndarray:
     z = jnp.multiply(a.astype(jnp.uint64), b.astype(jnp.uint64))
     z_reduced = self._jax_montgomery_reduce(z)
-    z_rns_reduced = self._jax_crns(z_reduced) # could be skipped for small prime
-    z_reduced = self._jax_montgomery_reduce(z_rns_reduced) # could be skipped for small prime (paired with the above)
+    z_rns_reduced = self._jax_crns(
+        z_reduced
+    )  # could be skipped for small prime
+    z_reduced = self._jax_montgomery_reduce(
+        z_rns_reduced
+    )  # could be skipped for small prime (paired with the above)
     return z_reduced
 
   def _modular_add(self, a: jnp.ndarray, b: jnp.ndarray) -> jnp.ndarray:
@@ -599,7 +758,10 @@ class DRNSlazyContext(DRNSlazyContextBase, JaxKernelContextBase):
     return z_reduced
 
   def _modular_negate(self, a: jax.Array) -> jax.Array:
-    return jnp.add(jnp.subtract(self.jax_parameters.rns_moduli_negate, a), self.jax_parameters.rns_moduli_sub)
+    return jnp.add(
+        jnp.subtract(self.jax_parameters.rns_moduli_negate, a),
+        self.jax_parameters.rns_moduli_sub,
+    )
 
   def modular_multiply(self, a: jax.Array, b: jax.Array) -> jax.Array:
     kernel_hash = hash_args(a.shape, a.dtype.__str__())
@@ -642,6 +804,7 @@ class DRNSlazyContext(DRNSlazyContextBase, JaxKernelContextBase):
 # Lazy matrix reduction context
 # =============================================================================
 
+
 def _lazy_check_carry(value_c: jax.Array) -> jax.Array:
   """Check whether any 32-bit chunk holds a value exceeding 32 bits."""
   return jnp.any(jnp.not_equal(jnp.right_shift(value_c, jnp.uint64(32)), 0))
@@ -656,7 +819,9 @@ def _lazy_carry_propagate(value_c: jax.Array) -> jax.Array:
   ).reshape(n, n)
   low = jnp.bitwise_and(value_c, jnp.uint64(0xFFFFFFFF))
   high = jnp.right_shift(value_c, jnp.uint64(32)).astype(jnp.uint16)
-  high = jnp.matmul(high, roll_mat, preferred_element_type=jnp.uint32).astype(jnp.uint16)
+  high = jnp.matmul(high, roll_mat, preferred_element_type=jnp.uint32).astype(
+      jnp.uint16
+  )
   return jnp.add(low, high.astype(jnp.uint64))
 
 
@@ -671,7 +836,7 @@ class LazyContextBase(FiniteFieldContextBase):
   def __init__(self, parameters: dict):
     super().__init__(parameters)
     raw_chunk_num_u8 = parameters.get(
-        "chunk_num_u8", math.ceil(self.prime.bit_length() / 8)
+        "chunk_num_u8", math.ceil(int(self.prime).bit_length() / 8)
     )
     # The byte pipeline in ``_mul_to_u8`` emits a ``4 * 2 * chunk_num_u32``-byte
     # buffer, and ``_modular_multiply`` slices ``high = vc[:, n8:2*n8+4]``
@@ -715,8 +880,7 @@ class LazyContextBase(FiniteFieldContextBase):
 
 
 class CROSSLazyContext(LazyContextBase, JaxKernelContextBase):
-  """Lazy matrix modular multiplication context for JAX.
-  """
+  """Lazy matrix modular multiplication context for JAX."""
 
   def __init__(self, parameters: dict):
     super().__init__(parameters)
@@ -728,7 +892,10 @@ class CROSSLazyContext(LazyContextBase, JaxKernelContextBase):
 
   def to_computational_format(self, a) -> jnp.ndarray:
     def _convert(x: int) -> jnp.ndarray:
-      return jnp.array(self._int_to_array(x % self.prime, self.chunk_num_u32), dtype=jnp.uint32)
+      return jnp.array(
+          self._int_to_array(x % self.prime, self.chunk_num_u32),
+          dtype=jnp.uint32,
+      )
 
     def _recurse(x):
       if isinstance(x, int):
@@ -737,7 +904,9 @@ class CROSSLazyContext(LazyContextBase, JaxKernelContextBase):
 
     converted_a = _recurse(a)
     if self.use_sharding:
-      named_sharding, padded_shape = self.create_named_sharding(shape=converted_a.shape, axes=[0])
+      named_sharding, padded_shape = self.create_named_sharding(
+          shape=converted_a.shape, axes=[0]
+      )
       converted_a = pad_jax_array(converted_a, padded_shape)
       return converted_a.to_device(named_sharding)
     else:
@@ -760,6 +929,11 @@ class CROSSLazyContext(LazyContextBase, JaxKernelContextBase):
   def _conv_1d(a: jax.Array, b: jax.Array) -> jax.Array:
     a = jax.lax.bitcast_convert_type(a, jnp.uint8).reshape(-1)
     b = jax.lax.bitcast_convert_type(b, jnp.uint8).reshape(-1)
+    if jax.default_backend() == "gpu":
+      # cuDNN's integer conv only supports s8, not u8, so route through
+      # float32 on GPU. u8*u8 sums fit exactly in float32's 24-bit mantissa.
+      res = jnp.convolve(a.astype(jnp.float32), b.astype(jnp.float32))
+      return res.astype(jnp.uint32)
     return jnp.convolve(a, b, preferred_element_type=jnp.uint32)
 
   def _rechunkify(self, x: jax.Array, n_u16: int, n_u32: int) -> jax.Array:
@@ -768,7 +942,9 @@ class CROSSLazyContext(LazyContextBase, JaxKernelContextBase):
     shift_u32 = jnp.array([[0, 16]] * n_u32, dtype=jnp.uint8)
     shape = x.shape[:-1] + (-1, 2) if x.ndim == 2 else (-1, 2)
     x = jnp.sum(jnp.left_shift(x.reshape(shape), shift_u16), axis=-1)
-    x = jnp.sum(jnp.left_shift(x.reshape(shape).astype(jnp.uint64), shift_u32), axis=-1)
+    x = jnp.sum(
+        jnp.left_shift(x.reshape(shape).astype(jnp.uint64), shift_u32), axis=-1
+    )
     return x
 
   def _mul_to_u8(self, a: jnp.ndarray, b: jnp.ndarray) -> jnp.ndarray:
@@ -786,9 +962,13 @@ class CROSSLazyContext(LazyContextBase, JaxKernelContextBase):
   def _sub_raw(self, a: jnp.ndarray, b: jnp.ndarray) -> jnp.ndarray:
     """Compute a - b assuming a >= b (batched, shape [batch, chunk_num_u32])."""
     n = self.chunk_num_u32
-    borrow_low = jnp.array([self.word_mask + 1] * (n - 1) + [0], dtype=jnp.uint64)
+    borrow_low = jnp.array(
+        [self.word_mask + 1] * (n - 1) + [0], dtype=jnp.uint64
+    )
     borrow_high = jnp.array([0] + [1] * (n - 2) + [0], dtype=jnp.uint64)
-    c = jnp.subtract(jnp.add(a.astype(jnp.uint64), borrow_low), b.astype(jnp.uint64))
+    c = jnp.subtract(
+        jnp.add(a.astype(jnp.uint64), borrow_low), b.astype(jnp.uint64)
+    )
     c = jnp.subtract(c, borrow_high)
     c = jax.lax.while_loop(_lazy_check_carry, _lazy_carry_propagate, c)
     c = c.at[:, n - 1].set(c[:, n - 1] - 1)
@@ -797,7 +977,9 @@ class CROSSLazyContext(LazyContextBase, JaxKernelContextBase):
   def _compare(self, a: jnp.ndarray, b: jnp.ndarray) -> jnp.ndarray:
     """Return per-batch sign: >=0 means a>=b, <0 means a<b."""
     sign = jnp.sign(a.astype(jnp.int64) - b.astype(jnp.int64))
-    weights = jnp.array([2**i for i in range(self.chunk_num_u32)], dtype=jnp.int32)
+    weights = jnp.array(
+        [2**i for i in range(self.chunk_num_u32)], dtype=jnp.int32
+    )
     return jnp.sum(sign * weights, axis=-1)
 
   # ---------- core modular operations ----------
@@ -807,7 +989,7 @@ class CROSSLazyContext(LazyContextBase, JaxKernelContextBase):
     batch = a.shape[0]
     vc = self._mul_to_u8(a, b)
     low = vc[:, :n8]
-    high = vc[:, n8:n8 * 2 + 4]
+    high = vc[:, n8 : n8 * 2 + 4]
     reduced = jnp.matmul(
         high.astype(jnp.uint16),
         self._lazy_mat_jnp,
@@ -817,11 +999,12 @@ class CROSSLazyContext(LazyContextBase, JaxKernelContextBase):
     vc2 = self._rechunkify(vc2, n8 // 2, n8 // 4)
     vc2 = jnp.pad(vc2, ((0, 0), (0, 1)))
     vc2 = jax.lax.while_loop(_lazy_check_carry, _lazy_carry_propagate, vc2)
-    return vc2.astype(jnp.uint32)[:, :self.chunk_num_u32]
+    return vc2.astype(jnp.uint32)[:, : self.chunk_num_u32]
 
   def _modular_add(self, a: jnp.ndarray, b: jnp.ndarray) -> jnp.ndarray:
     c = jax.lax.while_loop(
-        _lazy_check_carry, _lazy_carry_propagate,
+        _lazy_check_carry,
+        _lazy_carry_propagate,
         jnp.add(a.astype(jnp.uint64), b.astype(jnp.uint64)),
     )
     return c.astype(jnp.uint32)
@@ -879,17 +1062,30 @@ class CROSSLazyContext(LazyContextBase, JaxKernelContextBase):
       return self._modular_negate(a)
 
   def context_hash(self) -> str:
-    return hash_args(self.__class__.__name__, self.prime, self.chunk_num_u8, self.use_sharding)
+    return hash_args(
+        self.__class__.__name__,
+        self.prime,
+        self.chunk_num_u8,
+        self.use_sharding,
+    )
 
-  def _get_shape_dtype_structs(self, parameters: dict) -> list[jax.ShapeDtypeStruct]:
+  def _get_shape_dtype_structs(
+      self, parameters: dict
+  ) -> list[jax.ShapeDtypeStruct]:
     batch_shape = parameters["batch_shape"]
     operand_shape = batch_shape + (self.chunk_num_u32,)
     if self.use_sharding:
-      named_sharding, padded_shape = self.create_named_sharding(shape=operand_shape, axes=[0])
-      return [jax.ShapeDtypeStruct(padded_shape, jnp.uint32, sharding=named_sharding)]
+      named_sharding, padded_shape = self.create_named_sharding(
+          shape=operand_shape, axes=[0]
+      )
+      return [
+          jax.ShapeDtypeStruct(
+              padded_shape, jnp.uint32, sharding=named_sharding
+          )
+      ]
     return [jax.ShapeDtypeStruct(operand_shape, jnp.uint32)]
 
-  def serialize(self, parameters: dict):
+  def serialize(self, parameters):  # pytype: disable=signature-mismatch
     shape_dtype_structs = self._get_shape_dtype_structs(parameters)
     kernel_hash = hash_args(self.context_hash(), parameters)
     class_name = self.__class__.__name__
@@ -913,22 +1109,36 @@ class CROSSLazyContext(LazyContextBase, JaxKernelContextBase):
         name=f"{class_name}_modular_subtract_{kernel_hash}",
     )
     store_jax_executable(
-        self._modular_reduce, shape_dtype_structs[0], name=f"{class_name}_modular_reduce_{kernel_hash}"
+        self._modular_reduce,
+        shape_dtype_structs[0],
+        name=f"{class_name}_modular_reduce_{kernel_hash}",
     )
     store_jax_executable(
-        self._modular_negate, shape_dtype_structs[0], name=f"{class_name}_modular_negate_{kernel_hash}"
+        self._modular_negate,
+        shape_dtype_structs[0],
+        name=f"{class_name}_modular_negate_{kernel_hash}",
     )
 
-  def compile(self, parameters: dict):
+  def compile(self, parameters):  # pytype: disable=signature-mismatch
     shape_dtype_structs = self._get_shape_dtype_structs(parameters)
     kernel_hash = hash_args(self.context_hash(), parameters)
     class_name = self.__class__.__name__
 
-    modular_multiply_kernel = load_jax_executable(f"{class_name}_modular_multiply_{kernel_hash}")
-    modular_add_kernel = load_jax_executable(f"{class_name}_modular_add_{kernel_hash}")
-    modular_subtract_kernel = load_jax_executable(f"{class_name}_modular_subtract_{kernel_hash}")
-    modular_reduce_kernel = load_jax_executable(f"{class_name}_modular_reduce_{kernel_hash}")
-    modular_negate_kernel = load_jax_executable(f"{class_name}_modular_negate_{kernel_hash}")
+    modular_multiply_kernel = load_jax_executable(
+        f"{class_name}_modular_multiply_{kernel_hash}"
+    )
+    modular_add_kernel = load_jax_executable(
+        f"{class_name}_modular_add_{kernel_hash}"
+    )
+    modular_subtract_kernel = load_jax_executable(
+        f"{class_name}_modular_subtract_{kernel_hash}"
+    )
+    modular_reduce_kernel = load_jax_executable(
+        f"{class_name}_modular_reduce_{kernel_hash}"
+    )
+    modular_negate_kernel = load_jax_executable(
+        f"{class_name}_modular_negate_{kernel_hash}"
+    )
 
     if None in [
         modular_multiply_kernel,
@@ -938,25 +1148,57 @@ class CROSSLazyContext(LazyContextBase, JaxKernelContextBase):
         modular_negate_kernel,
     ]:
       # if not self.use_sharding:
-      warnings.warn(f"Not found stored serialized compiled kernels, compiling...", UserWarning, stacklevel=2)
+      warnings.warn(
+          f"Not found stored serialized compiled kernels, compiling...",
+          UserWarning,
+          stacklevel=2,
+      )
 
-    kernel_hash = hash_args(shape_dtype_structs[0].shape, shape_dtype_structs[0].dtype.__str__())
+    kernel_hash = hash_args(
+        shape_dtype_structs[0].shape, shape_dtype_structs[0].dtype.__str__()
+    )
 
     self.compiled_kernels[kernel_hash] = {
-        "modular_multiply": modular_multiply_kernel
-        if modular_multiply_kernel is not None
-        else jax_jit_lower_compile(self._modular_multiply, shape_dtype_structs[0], shape_dtype_structs[0]),
-        "modular_add": modular_add_kernel
-        if modular_add_kernel is not None
-        else jax_jit_lower_compile(self._modular_add, shape_dtype_structs[0], shape_dtype_structs[0]),
-        "modular_subtract": modular_subtract_kernel
-        if modular_subtract_kernel is not None
-        else jax_jit_lower_compile(self._modular_subtract, shape_dtype_structs[0], shape_dtype_structs[0]),
-        "modular_reduce": modular_reduce_kernel
-        if modular_reduce_kernel is not None
-        else jax_jit_lower_compile(self._modular_reduce, shape_dtype_structs[0]),
-        "modular_negate": modular_negate_kernel
-        if modular_negate_kernel is not None
-        else jax_jit_lower_compile(self._modular_negate, shape_dtype_structs[0]),
+        "modular_multiply": (
+            modular_multiply_kernel
+            if modular_multiply_kernel is not None
+            else jax_jit_lower_compile(
+                self._modular_multiply,
+                shape_dtype_structs[0],
+                shape_dtype_structs[0],
+            )
+        ),
+        "modular_add": (
+            modular_add_kernel
+            if modular_add_kernel is not None
+            else jax_jit_lower_compile(
+                self._modular_add,
+                shape_dtype_structs[0],
+                shape_dtype_structs[0],
+            )
+        ),
+        "modular_subtract": (
+            modular_subtract_kernel
+            if modular_subtract_kernel is not None
+            else jax_jit_lower_compile(
+                self._modular_subtract,
+                shape_dtype_structs[0],
+                shape_dtype_structs[0],
+            )
+        ),
+        "modular_reduce": (
+            modular_reduce_kernel
+            if modular_reduce_kernel is not None
+            else jax_jit_lower_compile(
+                self._modular_reduce, shape_dtype_structs[0]
+            )
+        ),
+        "modular_negate": (
+            modular_negate_kernel
+            if modular_negate_kernel is not None
+            else jax_jit_lower_compile(
+                self._modular_negate, shape_dtype_structs[0]
+            )
+        ),
     }
     self.use_compiled_kernels = True

@@ -1,14 +1,12 @@
 import jax
 import finite_field_context as ff_context
+import utils
+import numpy as np
+
 from absl.testing import absltest
 from absl.testing import parameterized
 
 jax.config.update("jax_enable_x64", True)
-import numpy as np
-import jax.numpy as jnp
-import utils
-import os
-
 
 FF = [
     (
@@ -36,14 +34,12 @@ class FiniteFieldTest(parameterized.TestCase):
     rns_moduli = utils.find_moduli_specified_number(32, 28)
     ref_value_c = [(a * b) % prime for a, b in zip(value_a, value_b)]
 
-    ctx = ff_context.DRNSlazyContext(
-        {
-            "prime": prime,
-            "rns_moduli": rns_moduli,
-            "precision_bits": 28,
-            "radix_bits": 32,
-        }
-    )
+    ctx = ff_context.DRNSlazyContext({
+        "prime": prime,
+        "rns_moduli": rns_moduli,
+        "precision_bits": 28,
+        "radix_bits": 32,
+    })
 
     value_a_m = ctx.to_computational_format(value_a)
     value_b_m = ctx.to_computational_format(value_b)
@@ -51,7 +47,6 @@ class FiniteFieldTest(parameterized.TestCase):
     value_c = ctx.to_original_format(value_c_m)
 
     np.testing.assert_array_equal(value_c, ref_value_c)
-
 
   @parameterized.named_parameters(*FF)
   def test_lazy_modular_multiply(self, value_a, value_b):

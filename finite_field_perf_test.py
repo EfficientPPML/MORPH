@@ -2,12 +2,12 @@ import os
 
 import jax
 import jax.numpy as jnp
+import finite_field_context as ff_context
+import profiler
+import utils
+
 from absl.testing import absltest
 from absl.testing import parameterized
-
-import finite_field_context as ff_context
-import utils
-from profiler import KernelWrapper, Profiler, collect_logs
 
 jax.config.update("jax_enable_x64", True)
 
@@ -15,7 +15,7 @@ PRIME = 0x01AE3A4617C510EAC63B05C06CA1493B1A22D9F300F5138F1EF3622FBA094800170B5D
 
 BATCH_SIZE_LIST = [4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
 
-NUM_MODULI_LIST = [32] # 21 for 256-bit, 32 for 384-bit, 56 for 753-bit
+NUM_MODULI_LIST = [32]  # 21 for 256-bit, 32 for 384-bit, 56 for 753-bit
 
 TEST_PARAMS = [(f"moduli_{n}", n, BATCH_SIZE_LIST) for n in NUM_MODULI_LIST]
 
@@ -28,7 +28,11 @@ class FiniteFieldModularMultiplyPerformanceTest(parameterized.TestCase):
 
   def setUp(self):
     super().setUp()
-    self.output_trace_root = os.path.join(os.path.dirname(__file__), "log")
+    outputs_dir = os.environ.get("TEST_UNDECLARED_OUTPUTS_DIR")
+    if outputs_dir:
+      self.output_trace_root = os.path.join(outputs_dir, "log")
+    else:
+      self.output_trace_root = os.path.join(os.path.dirname(__file__), "log")
     self.profiler_config = {
         "iterations": 1,
         "save_to_file": True,
@@ -39,11 +43,11 @@ class FiniteFieldModularMultiplyPerformanceTest(parameterized.TestCase):
     super().tearDownClass()
     root_dir = os.path.dirname(os.path.abspath(__file__))
     print(f"Collecting logs from: {root_dir}")
-    collect_logs(root_dir)
+    profiler.collect_logs(root_dir)
 
   def _create_kernel_wrapper(self, kernel_name, ctx, batch, num_moduli):
     input_shape = (batch, num_moduli)
-    return KernelWrapper(
+    return profiler.KernelWrapper(
         kernel_name=kernel_name,
         function_to_wrap=_modular_multiply_kernel,
         input_structs=[
@@ -56,16 +60,14 @@ class FiniteFieldModularMultiplyPerformanceTest(parameterized.TestCase):
   def _profile_modular_multiply(self, num_moduli, batch_size_list):
     rns_moduli = utils.find_moduli_specified_number(num_moduli, 28)
 
-    ctx = ff_context.DRNSlazyContext(
-        {
-            "prime": PRIME,
-            "rns_moduli": rns_moduli,
-            "precision_bits": 28,
-            "radix_bits": 32,
-        }
-    )
+    ctx = ff_context.DRNSlazyContext({
+        "prime": PRIME,
+        "rns_moduli": rns_moduli,
+        "precision_bits": 28,
+        "radix_bits": 32,
+    })
 
-    profiler_instance = Profiler(
+    profiler_instance = profiler.Profiler(
         output_trace_path=self.output_trace_root,
         profile_naming=f"ff_modular_multiply_moduli_{num_moduli}",
         configuration=self.profiler_config,
@@ -93,7 +95,9 @@ class FiniteFieldModularMultiplyPerformanceTest(parameterized.TestCase):
     profiler_instance.post_process_all_profilers()
 
   @parameterized.named_parameters(*TEST_PARAMS)
-  def test_DRNSlazy_modular_multiply_performance(self, num_moduli, batch_size_list):
+  def test_DRNSlazy_modular_multiply_performance(
+      self, num_moduli, batch_size_list
+  ):
     self._profile_modular_multiply(
         num_moduli=num_moduli,
         batch_size_list=batch_size_list,

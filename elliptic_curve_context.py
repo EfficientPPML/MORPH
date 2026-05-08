@@ -1,24 +1,32 @@
-from abc import ABC, abstractmethod
-import math
-import logging
-import multiprocessing
-from typing import Tuple, Union
-import copy
-import numpy as np
-import warnings
-import os
+import abc
 from concurrent.futures import ProcessPoolExecutor
-from functools import partial
+import functools
+import multiprocessing
+import os
+import warnings
+
 import jax
 import jax.numpy as jnp
+import numpy as np
+
+import finite_field_context
+import utils
+
+FiniteFieldContextBase = finite_field_context.FiniteFieldContextBase
+abstractmethod = abc.abstractmethod
+ABC = abc.ABC
+
 
 # Use 'forkserver' to avoid JAX multithreading + fork deadlock
 _MP_CONTEXT = multiprocessing.get_context("forkserver")
 
-import utils
-from utils import JaxParameters, JaxKernelContextBase, hash_args, pad_jax_array, store_jax_executable, load_jax_executable, jax_jit_lower_compile
-from finite_field_context import FiniteFieldContextBase
-
+JaxParameters = utils.JaxParameters
+JaxKernelContextBase = utils.JaxKernelContextBase
+hash_args = utils.hash_args
+pad_jax_array = utils.pad_jax_array
+store_jax_executable = utils.store_jax_executable
+load_jax_executable = utils.load_jax_executable
+jax_jit_lower_compile = utils.jax_jit_lower_compile
 jax.config.update("jax_enable_x64", True)
 
 
@@ -39,9 +47,14 @@ class EllipticCurveContextBase(ABC):
     self.parameters = parameters
     self.prime = parameters.get("prime", None)
     assert self.prime is not None, "prime must be provided"
+    self.zero_point = None
     ff_ctx_class = parameters.get("finite_field_context_class", None)
-    assert ff_ctx_class is not None, "finite_field_context_class must be provided"
-    self.ff_ctx: FiniteFieldContextBase = ff_ctx_class(parameters.get("finite_field_parameters", {}))
+    assert (
+        ff_ctx_class is not None
+    ), "finite_field_context_class must be provided"
+    self.ff_ctx: FiniteFieldContextBase = ff_ctx_class(
+        parameters.get("finite_field_parameters", {})
+    )
 
   @abstractmethod
   def to_computational_format(self, a) -> jnp.ndarray:
@@ -56,7 +69,7 @@ class EllipticCurveContextBase(ABC):
     pass
 
   @abstractmethod
-  def to_original_format(self, a) -> jnp.ndarray:
+  def to_original_format(self, a):
     """Convert from computational format back to standard representation.
 
     Args:
@@ -68,7 +81,7 @@ class EllipticCurveContextBase(ABC):
     pass
 
   @abstractmethod
-  def point_add(self, a: jnp.ndarray, b: jnp.ndarray) -> jnp.ndarray:
+  def point_add(self, a: jnp.ndarray, b: jnp.ndarray):
     """Perform point addition: (a + b)
 
     Args:
@@ -81,7 +94,7 @@ class EllipticCurveContextBase(ABC):
     pass
 
   @abstractmethod
-  def point_double(self, a: jnp.ndarray) -> jnp.ndarray:
+  def point_double(self, a: jnp.ndarray):
     """Perform point doubling: (2 * a)
 
     Args:
@@ -123,39 +136,61 @@ class CPUWeierstrassAffineContext(EllipticCurveContextBase):
     self.a = parameters["a"]
     self.b = parameters["b"]
 
-  def point_add(self, point_a: jnp.ndarray, point_b: jnp.ndarray) -> jnp.ndarray:
-    raise NotImplementedError("CPUWeierstrassAffineContext: point_add is not implemented")
+  def point_add(
+      self, point_a: jnp.ndarray, point_b: jnp.ndarray
+  ) -> jnp.ndarray:
+    raise NotImplementedError(
+        "CPUWeierstrassAffineContext: point_add is not implemented"
+    )
 
   def point_double(self, point: jnp.ndarray) -> jnp.ndarray:
-    raise NotImplementedError("CPUWeierstrassAffineContext: point_double is not implemented")
+    raise NotImplementedError(
+        "CPUWeierstrassAffineContext: point_double is not implemented"
+    )
 
   def to_computational_format(self, a: list) -> jnp.ndarray:
-    raise NotImplementedError("CPUWeierstrassAffineContext: to_computational_format is not implemented")
+    raise NotImplementedError(
+        "CPUWeierstrassAffineContext: to_computational_format is not"
+        " implemented"
+    )
 
   def to_original_format(self, a: jnp.ndarray) -> list:
-    raise NotImplementedError("CPUWeierstrassAffineContext: to_original_format is not implemented")
+    raise NotImplementedError(
+        "CPUWeierstrassAffineContext: to_original_format is not implemented"
+    )
 
-  def _point_add(self, point_a: list, point_b: list) -> list[int]:
+  def _point_add(self, point_a: list, point_b: list) -> list:
     def single_point_add(point_a: list, point_b: list) -> list[int]:
       x1, y1 = point_a
       x2, y2 = point_b
-      slope = self._modular_divide(self._modular_reduce(y2 - y1), self._modular_reduce(x2 - x1))
+      slope = self._modular_divide(
+          self._modular_reduce(y2 - y1), self._modular_reduce(x2 - x1)
+      )
       x3 = self._modular_reduce(self._modular_multiply(slope, slope) - x1 - x2)
-      y3 = self._modular_reduce(self._modular_multiply(slope, self._modular_reduce(x1 - x3)) - y1)
+      y3 = self._modular_reduce(
+          self._modular_multiply(slope, self._modular_reduce(x1 - x3)) - y1
+      )
       return [x3, y3]
 
     list_depth = utils.nested_list_depth(point_a)
     if list_depth == 1:
       return single_point_add(point_a, point_b)
     elif list_depth == 2:
-      return [single_point_add(point_a_i, point_b_i) for point_a_i, point_b_i in zip(point_a, point_b)]
+      return [
+          single_point_add(point_a_i, point_b_i)
+          for point_a_i, point_b_i in zip(point_a, point_b)
+      ]
     else:
-      raise ValueError(f"Invalid list depth {list_depth} of input for point addition")
+      raise ValueError(
+          f"Invalid list depth {list_depth} of input for point addition"
+      )
 
-  def _point_double(self, point: list[int]) -> list[int]:
+  def _point_double(self, point: list) -> list:
     def single_point_double(point: list) -> list[int]:
       x, y = point
-      slope = self._modular_divide(self._modular_reduce(3 * x * x + self.a), self._modular_reduce(2 * y))
+      slope = self._modular_divide(
+          self._modular_reduce(3 * x * x + self.a), self._modular_reduce(2 * y)
+      )
       x3 = self._modular_reduce(self._modular_multiply(slope, slope) - 2 * x)
       y3 = self._modular_reduce(self._modular_multiply(slope, x - x3) - y)
       return [x3, y3]
@@ -186,7 +221,9 @@ class ExtendedTwistedEdwardsContextBase(EllipticCurveContextBase):
     self.zero_point = [0, 1, 1, 0]
 
   def _twist(self, coordinates: list[int]) -> list[int]:
-    assert len(coordinates) == 2, "Twisted Edwards coordinates must be of length 2"
+    assert (
+        len(coordinates) == 2
+    ), "Twisted Edwards coordinates must be of length 2"
     x, y = coordinates
     # Convert to montgomery (Notel it is ec montgomery not field montgomery)
     xm = self._modular_reduce(self.s * (x - self.alpha))
@@ -205,7 +242,9 @@ class ExtendedTwistedEdwardsContextBase(EllipticCurveContextBase):
     return [xt, yt]
 
   def _untwist(self, coordinates: list[int]) -> list[int]:
-    assert len(coordinates) == 2, "Twisted Edwards coordinates must be of length 2"
+    assert (
+        len(coordinates) == 2
+    ), "Twisted Edwards coordinates must be of length 2"
     xt, yt = coordinates
     xt = self._modular_divide(xt, self.t)
     # Convert to montgomery
@@ -213,32 +252,43 @@ class ExtendedTwistedEdwardsContextBase(EllipticCurveContextBase):
     ym = self._modular_divide((1 + yt), self._modular_multiply((1 - yt), xt))
     # Convert to weierstrass
     x = self._modular_reduce(
-        self._modular_divide(xm, self.B) + self._modular_divide(self.A, self._modular_multiply(3, self.B))
+        self._modular_divide(xm, self.B)
+        + self._modular_divide(self.A, self._modular_multiply(3, self.B))
     )
     y = self._modular_divide(ym, self.B)
     return [x, y]
 
   def _convert_to_edwards_affine(self, coordinates: list[int]) -> list[int]:
-    assert len(coordinates) == 4, "Twisted Edwards coordinates must be of length 2"
+    assert (
+        len(coordinates) == 4
+    ), "Twisted Edwards coordinates must be of length 2"
     x, y, z, t = coordinates
     z_inv = self._modular_divide(1, z)
     x = self._modular_multiply(x, z_inv)
     y = self._modular_multiply(y, z_inv)
     return [x, y]
 
-  def _convert_to_extended_twisted_edwards(self, coordinates: list[int]) -> list[int]:
-    assert len(coordinates) == 2, "Twisted Edwards coordinates must be of length 2"
+  def _convert_to_extended_twisted_edwards(
+      self, coordinates: list[int]
+  ) -> list[int]:
+    assert (
+        len(coordinates) == 2
+    ), "Twisted Edwards coordinates must be of length 2"
     xt, yt = self._twist(coordinates)
     return [xt, yt, 1, self._modular_multiply(xt, yt)]
 
   def _convert_to_weierstrass_affine(self, coordinates: list[int]) -> list[int]:
-    assert len(coordinates) == 4, "Extended Twisted Edwards coordinates must be of length 4"
+    assert (
+        len(coordinates) == 4
+    ), "Extended Twisted Edwards coordinates must be of length 4"
     affine_coords = self._convert_to_edwards_affine(coordinates)
     untwisted_coords = self._untwist(affine_coords)
     return untwisted_coords
 
 
-class ExtendedTwistedEdwardsContext(ExtendedTwistedEdwardsContextBase, JaxKernelContextBase):
+class ExtendedTwistedEdwardsContext(
+    ExtendedTwistedEdwardsContextBase, JaxKernelContextBase
+):
 
   def __init__(self, parameters: dict):
     super().__init__(parameters)
@@ -252,9 +302,14 @@ class ExtendedTwistedEdwardsContext(ExtendedTwistedEdwardsContextBase, JaxKernel
     if list_depth == 1:
       twisted_coords = self._convert_to_extended_twisted_edwards(a)
     elif list_depth == 2:
-      twisted_coords = [self._convert_to_extended_twisted_edwards(a_i) for a_i in a]
+      twisted_coords = [
+          self._convert_to_extended_twisted_edwards(a_i) for a_i in a
+      ]
     else:
-      raise ValueError("Invalid list depth of input for converting to extended twisted edwards coordinates")
+      raise ValueError(
+          "Invalid list depth of input for converting to extended twisted"
+          " edwards coordinates"
+      )
     result = self.ff_ctx.to_computational_format(twisted_coords)
     if list_depth == 1:
       result = jnp.broadcast_to(result, (result.shape[0], 1, result.shape[1]))
@@ -262,25 +317,31 @@ class ExtendedTwistedEdwardsContext(ExtendedTwistedEdwardsContextBase, JaxKernel
       result = result.transpose(1, 0, 2)
     # NOTE: the computational format dim is (coordinates, batch, precision)
     if self.use_sharding:
-      named_sharding, padded_shape = self.create_named_sharding(shape=result.shape, axes=[1])
+      named_sharding, padded_shape = self.create_named_sharding(
+          shape=result.shape, axes=[1]
+      )
       result = pad_jax_array(result, padded_shape)
       return result.to_device(named_sharding)
     else:
       return result.to_device(jax.devices()[0])
 
-
   def to_original_format(self, a: jnp.ndarray) -> list:
     dim = a.ndim
     # NOTE: the computational format dim is (coordinates, batch, precision)
     if dim == 3:
-      a = a.transpose(1, 0, 2)  # (coordinates, batch, precision) -> (batch, coordinates, precision)
+      a = a.transpose(
+          1, 0, 2
+      )  # (coordinates, batch, precision) -> (batch, coordinates, precision)
     a = self.ff_ctx.to_original_format(a)
     if dim == 2:
       affine_coords = self._convert_to_weierstrass_affine(a)
     elif dim == 3:
       affine_coords = [self._convert_to_weierstrass_affine(a_i) for a_i in a]
     else:
-      raise ValueError("Invalid dimension of input for converting to weierstrass affine coordinates")
+      raise ValueError(
+          "Invalid dimension of input for converting to weierstrass affine"
+          " coordinates"
+      )
     return affine_coords
 
   def _init_jax_parameters(self):
@@ -288,7 +349,9 @@ class ExtendedTwistedEdwardsContext(ExtendedTwistedEdwardsContextBase, JaxKernel
         twist_d=self.ff_ctx.to_computational_format(self.twist_d),
     )
 
-  def _point_add(self, point_a: jnp.ndarray, point_b: jnp.ndarray) -> jnp.ndarray:
+  def _point_add(
+      self, point_a: jnp.ndarray, point_b: jnp.ndarray
+  ) -> jnp.ndarray:
     twist_d = self.jax_parameters.twist_d
 
     inputsl = point_a
@@ -302,7 +365,9 @@ class ExtendedTwistedEdwardsContext(ExtendedTwistedEdwardsContextBase, JaxKernel
 
     e1 = self.ff_ctx._modular_add(pax, pay)
     e2 = self.ff_ctx._modular_add(pbx, pby)
-    twist_d_here = jnp.broadcast_to(twist_d.reshape(-1, twist_d.shape[0]), c.shape)
+    twist_d_here = jnp.broadcast_to(
+        twist_d.reshape(-1, twist_d.shape[0]), c.shape
+    )
     if self.use_sharding:
       twist_d_here = jax.sharding.reshard(twist_d_here, jax.typeof(e2).sharding)
     inputsl = jnp.concatenate((e1, c), axis=0)
@@ -339,7 +404,9 @@ class ExtendedTwistedEdwardsContext(ExtendedTwistedEdwardsContextBase, JaxKernel
     outputs = self.ff_ctx._modular_multiply(inputsl, inputsr)
     return outputs.reshape(4, -1, outputs.shape[-1])
 
-  def point_add(self, point_a: jnp.ndarray, point_b: jnp.ndarray) -> jnp.ndarray:
+  def point_add(
+      self, point_a: jnp.ndarray, point_b: jnp.ndarray
+  ) -> jnp.ndarray:
 
     if self.use_compiled_kernels:
       kernel_hash = hash_args(point_a.shape, point_a.dtype.__str__())
@@ -352,17 +419,27 @@ class ExtendedTwistedEdwardsContext(ExtendedTwistedEdwardsContextBase, JaxKernel
     raise ValueError("point_double has logic bug")
     shape_dtype_struct = jax.ShapeDtypeStruct(point.shape, point.dtype)
     if self.use_compiled_kernels:
-      return self.compiled_kernels[shape_dtype_struct.__hash__()]["point_double"](point)
+      return self.compiled_kernels[shape_dtype_struct.__hash__()][
+          "point_double"
+      ](point)
     else:
       return self._point_double(point)
 
-  def _get_shape_dtype_structs(self, parameters: dict) -> list[jax.ShapeDtypeStruct]:
+  def _get_shape_dtype_structs(
+      self, parameters: dict
+  ) -> list[jax.ShapeDtypeStruct]:
     batch_size = parameters["batch_size"]
     num_moduli = self.jax_parameters.twist_d.shape[0]
     point_shape = (4, batch_size, num_moduli)
     if self.use_sharding:
-      named_sharding, padded_shape = self.create_named_sharding(shape=point_shape, axes=[1])
-      return [jax.ShapeDtypeStruct(padded_shape, jnp.uint32, sharding=named_sharding)]
+      named_sharding, padded_shape = self.create_named_sharding(
+          shape=point_shape, axes=[1]
+      )
+      return [
+          jax.ShapeDtypeStruct(
+              padded_shape, jnp.uint32, sharding=named_sharding
+          )
+      ]
     return [jax.ShapeDtypeStruct(point_shape, jnp.uint32)]
 
   def context_hash(self) -> str:
@@ -385,36 +462,64 @@ class ExtendedTwistedEdwardsContext(ExtendedTwistedEdwardsContextBase, JaxKernel
     class_name = self.__class__.__name__
 
     store_jax_executable(
-        self._point_add, shape_dtype_structs[0], shape_dtype_structs[0], name=f"{class_name}_point_add_{kernel_hash}"
+        self._point_add,
+        shape_dtype_structs[0],
+        shape_dtype_structs[0],
+        name=f"{class_name}_point_add_{kernel_hash}",
     )
-    store_jax_executable(self._point_double, shape_dtype_structs[0], name=f"{class_name}_point_double_{kernel_hash}")
+    store_jax_executable(
+        self._point_double,
+        shape_dtype_structs[0],
+        name=f"{class_name}_point_double_{kernel_hash}",
+    )
 
   def compile(self, parameters: dict):
     shape_dtype_structs = self._get_shape_dtype_structs(parameters)
     kernel_hash = hash_args(self.context_hash(), parameters)
     class_name = self.__class__.__name__
 
-    point_add_kernel = load_jax_executable(f"{class_name}_point_add_{kernel_hash}")
-    point_double_kernel = load_jax_executable(f"{class_name}_point_double_{kernel_hash}")
+    point_add_kernel = load_jax_executable(
+        f"{class_name}_point_add_{kernel_hash}"
+    )
+    point_double_kernel = load_jax_executable(
+        f"{class_name}_point_double_{kernel_hash}"
+    )
 
     if None in [point_add_kernel, point_double_kernel]:
-      warnings.warn(f"Not found stored serialized compiled kernels, compiling...", UserWarning, stacklevel=2)
-    
-    kernel_hash = hash_args(shape_dtype_structs[0].shape, shape_dtype_structs[0].dtype.__str__())
+      warnings.warn(
+          f"Not found stored serialized compiled kernels, compiling...",
+          UserWarning,
+          stacklevel=2,
+      )
+
+    kernel_hash = hash_args(
+        shape_dtype_structs[0].shape, shape_dtype_structs[0].dtype.__str__()
+    )
     self.compiled_kernels[kernel_hash] = {
-        "point_add": point_add_kernel
-        if point_add_kernel is not None
-        else jax_jit_lower_compile(self._point_add, shape_dtype_structs[0], shape_dtype_structs[0]),
-        "point_double": point_double_kernel
-        if point_double_kernel is not None
-        else jax_jit_lower_compile(self._point_double, shape_dtype_structs[0]),
+        "point_add": (
+            point_add_kernel
+            if point_add_kernel is not None
+            else jax_jit_lower_compile(
+                self._point_add, shape_dtype_structs[0], shape_dtype_structs[0]
+            )
+        ),
+        "point_double": (
+            point_double_kernel
+            if point_double_kernel is not None
+            else jax_jit_lower_compile(
+                self._point_double, shape_dtype_structs[0]
+            )
+        ),
     }
     self.use_compiled_kernels = True
 
 
-def _twist_extend_and_rns_worker(point, s, alpha, prime, prime_m2, t, rns_moduli, radix_bits):
+def _twist_extend_and_rns_worker(
+    point, s, alpha, prime, prime_m2, t, rns_moduli, radix_bits
+):
   """Module-level worker: twist + extend + RNS conversion using gmpy2 (must be picklable)."""
   import gmpy2
+
   x, y = gmpy2.mpz(point[0]), gmpy2.mpz(point[1])
   xm = (s * (x - alpha)) % prime
   ym = (s * y) % prime
@@ -431,7 +536,9 @@ def _twist_extend_and_rns_worker(point, s, alpha, prime, prime_m2, t, rns_moduli
   return [[(((c % m) << radix_bits) % m) for m in rns_moduli] for c in coords]
 
 
-class ExtendedTwistedEdwardsNDContext(ExtendedTwistedEdwardsContextBase, JaxKernelContextBase):
+class ExtendedTwistedEdwardsNDContext(
+    ExtendedTwistedEdwardsContextBase, JaxKernelContextBase
+):
   """Extended Twisted Edwards context supporting arbitrary batch dimensions.
 
   Computational format layout: (coordinates=4, *batch_dims, precision)
@@ -463,26 +570,38 @@ class ExtendedTwistedEdwardsNDContext(ExtendedTwistedEdwardsContextBase, JaxKern
     _PARALLEL_THRESHOLD = 2048
     if list_depth == 2 and len(a) >= _PARALLEL_THRESHOLD:
       import gmpy2
+
       ff_ctx = self.ff_ctx
-      worker = partial(
+      worker = functools.partial(
           _twist_extend_and_rns_worker,
-          s=gmpy2.mpz(self.s), alpha=gmpy2.mpz(self.alpha),
-          prime=gmpy2.mpz(self.prime), prime_m2=gmpy2.mpz(self.prime - 2),
+          s=gmpy2.mpz(self.s),
+          alpha=gmpy2.mpz(self.alpha),
+          prime=gmpy2.mpz(self.prime),
+          prime_m2=gmpy2.mpz(self.prime - 2),
           t=gmpy2.mpz(self.t),
-          rns_moduli=ff_ctx.rns_moduli, radix_bits=ff_ctx.radix_bits,
+          rns_moduli=ff_ctx.rns_moduli,
+          radix_bits=ff_ctx.radix_bits,
       )
       num_workers = min(64, os.cpu_count() or 1, max(1, len(a) // 256))
-      with ProcessPoolExecutor(max_workers=num_workers, mp_context=_MP_CONTEXT) as pool:
-        rns_coords = list(pool.map(worker, a, chunksize=max(1, len(a) // num_workers)))
+      with ProcessPoolExecutor(
+          max_workers=num_workers, mp_context=_MP_CONTEXT
+      ) as pool:
+        rns_coords = list(
+            pool.map(worker, a, chunksize=max(1, len(a) // num_workers))
+        )
       # rns_coords: list of (4, moduli_num) per point → (N, 4, moduli_num) array
-      result = jnp.array(np.array(rns_coords, dtype=np.uint32), dtype=jnp.uint32)
+      result = jnp.array(
+          np.array(rns_coords, dtype=np.uint32), dtype=jnp.uint32
+      )
       # (N, 4, moduli_num) → (4, N, moduli_num)
       result = result.transpose(1, 0, 2)
     else:
+
       def recursive_twist(lst, depth):
         if depth == 1:
           return self._convert_to_extended_twisted_edwards(lst)
         return [recursive_twist(item, depth - 1) for item in lst]
+
       twisted_coords = recursive_twist(a, list_depth)
 
       result = self.ff_ctx.to_computational_format(twisted_coords)
@@ -500,7 +619,9 @@ class ExtendedTwistedEdwardsNDContext(ExtendedTwistedEdwardsContextBase, JaxKern
       shard_axes = list(range(1, min(3, result.ndim - 1)))
       if not shard_axes:
         shard_axes = [1]
-      named_sharding, padded_shape = self.create_named_sharding(shape=result.shape, axes=shard_axes)
+      named_sharding, padded_shape = self.create_named_sharding(
+          shape=result.shape, axes=shard_axes
+      )
       result = pad_jax_array(result, padded_shape)
       return result.to_device(named_sharding)
     else:
@@ -521,6 +642,7 @@ class ExtendedTwistedEdwardsNDContext(ExtendedTwistedEdwardsContextBase, JaxKern
     a_orig = self.ff_ctx.to_original_format(a)
 
     batch_depth = ndim - 2
+
     def recursive_untwist(lst, depth):
       if depth == 0:
         return self._convert_to_weierstrass_affine(lst)
@@ -533,7 +655,9 @@ class ExtendedTwistedEdwardsNDContext(ExtendedTwistedEdwardsContextBase, JaxKern
         twist_d=self.ff_ctx.to_computational_format(self.twist_d),
     )
 
-  def _point_add(self, point_a: jnp.ndarray, point_b: jnp.ndarray) -> jnp.ndarray:
+  def _point_add(
+      self, point_a: jnp.ndarray, point_b: jnp.ndarray
+  ) -> jnp.ndarray:
     twist_d = self.jax_parameters.twist_d
 
     inputsl = point_a
@@ -587,7 +711,9 @@ class ExtendedTwistedEdwardsNDContext(ExtendedTwistedEdwardsContextBase, JaxKern
     outputs = self.ff_ctx._modular_multiply(inputsl, inputsr)
     return outputs.reshape(original_shape)
 
-  def point_add(self, point_a: jnp.ndarray, point_b: jnp.ndarray) -> jnp.ndarray:
+  def point_add(
+      self, point_a: jnp.ndarray, point_b: jnp.ndarray
+  ) -> jnp.ndarray:
     if self.use_compiled_kernels:
       kernel_hash = hash_args(point_a.shape, point_a.dtype.__str__())
       return self.compiled_kernels[kernel_hash]["point_add"](point_a, point_b)
@@ -599,11 +725,15 @@ class ExtendedTwistedEdwardsNDContext(ExtendedTwistedEdwardsContextBase, JaxKern
     raise ValueError("point_double has logic bug")
     shape_dtype_struct = jax.ShapeDtypeStruct(point.shape, point.dtype)
     if self.use_compiled_kernels:
-      return self.compiled_kernels[shape_dtype_struct.__hash__()]["point_double"](point)
+      return self.compiled_kernels[shape_dtype_struct.__hash__()][
+          "point_double"
+      ](point)
     else:
       return self._point_double(point)
 
-  def _get_shape_dtype_structs(self, parameters: dict) -> list[jax.ShapeDtypeStruct]:
+  def _get_shape_dtype_structs(
+      self, parameters: dict
+  ) -> list[jax.ShapeDtypeStruct]:
     batch_shape = parameters.get("batch_shape", None)
     if batch_shape is None:
       batch_shape = (parameters["batch_size"],)
@@ -613,8 +743,14 @@ class ExtendedTwistedEdwardsNDContext(ExtendedTwistedEdwardsContextBase, JaxKern
       shard_axes = list(range(1, min(3, len(point_shape) - 1)))
       if not shard_axes:
         shard_axes = [1]
-      named_sharding, padded_shape = self.create_named_sharding(shape=point_shape, axes=shard_axes)
-      return [jax.ShapeDtypeStruct(padded_shape, jnp.uint32, sharding=named_sharding)]
+      named_sharding, padded_shape = self.create_named_sharding(
+          shape=point_shape, axes=shard_axes
+      )
+      return [
+          jax.ShapeDtypeStruct(
+              padded_shape, jnp.uint32, sharding=named_sharding
+          )
+      ]
     return [jax.ShapeDtypeStruct(point_shape, jnp.uint32)]
 
   def context_hash(self) -> str:
@@ -637,29 +773,53 @@ class ExtendedTwistedEdwardsNDContext(ExtendedTwistedEdwardsContextBase, JaxKern
     class_name = self.__class__.__name__
 
     store_jax_executable(
-        self._point_add, shape_dtype_structs[0], shape_dtype_structs[0], name=f"{class_name}_point_add_{kernel_hash}"
+        self._point_add,
+        shape_dtype_structs[0],
+        shape_dtype_structs[0],
+        name=f"{class_name}_point_add_{kernel_hash}",
     )
-    store_jax_executable(self._point_double, shape_dtype_structs[0], name=f"{class_name}_point_double_{kernel_hash}")
+    store_jax_executable(
+        self._point_double,
+        shape_dtype_structs[0],
+        name=f"{class_name}_point_double_{kernel_hash}",
+    )
 
   def compile(self, parameters: dict):
     shape_dtype_structs = self._get_shape_dtype_structs(parameters)
     kernel_hash = hash_args(self.context_hash(), parameters)
     class_name = self.__class__.__name__
 
-    point_add_kernel = load_jax_executable(f"{class_name}_point_add_{kernel_hash}")
-    point_double_kernel = load_jax_executable(f"{class_name}_point_double_{kernel_hash}")
+    point_add_kernel = load_jax_executable(
+        f"{class_name}_point_add_{kernel_hash}"
+    )
+    point_double_kernel = load_jax_executable(
+        f"{class_name}_point_double_{kernel_hash}"
+    )
 
     if None in [point_add_kernel, point_double_kernel]:
-      warnings.warn(f"Not found stored serialized compiled kernels, compiling...", UserWarning, stacklevel=2)
+      warnings.warn(
+          f"Not found stored serialized compiled kernels, compiling...",
+          UserWarning,
+          stacklevel=2,
+      )
 
-    kernel_hash = hash_args(shape_dtype_structs[0].shape, shape_dtype_structs[0].dtype.__str__())
+    kernel_hash = hash_args(
+        shape_dtype_structs[0].shape, shape_dtype_structs[0].dtype.__str__()
+    )
     self.compiled_kernels[kernel_hash] = {
-        "point_add": point_add_kernel
-        if point_add_kernel is not None
-        else jax_jit_lower_compile(self._point_add, shape_dtype_structs[0], shape_dtype_structs[0]),
-        "point_double": point_double_kernel
-        if point_double_kernel is not None
-        else jax_jit_lower_compile(self._point_double, shape_dtype_structs[0]),
+        "point_add": (
+            point_add_kernel
+            if point_add_kernel is not None
+            else jax_jit_lower_compile(
+                self._point_add, shape_dtype_structs[0], shape_dtype_structs[0]
+            )
+        ),
+        "point_double": (
+            point_double_kernel
+            if point_double_kernel is not None
+            else jax_jit_lower_compile(
+                self._point_double, shape_dtype_structs[0]
+            )
+        ),
     }
     self.use_compiled_kernels = True
-

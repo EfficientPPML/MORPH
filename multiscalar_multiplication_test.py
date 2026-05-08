@@ -1,15 +1,14 @@
 import os
 
 import jax
-import jax.numpy as jnp
-import numpy as np
-from absl.testing import absltest
-from absl.testing import parameterized
-
-import finite_field_context as ff_context
 import elliptic_curve_context as ec_context
+import finite_field_context as ff_context
 import multiscalar_multiplication_context as msm_context
 import utils
+import numpy as np
+
+from absl.testing import absltest
+from absl.testing import parameterized
 
 jax.config.update("jax_enable_x64", True)
 
@@ -19,9 +18,7 @@ RNS_MODULI = utils.find_moduli_specified_number(NUM_MODULI, 28)
 
 MSM_DIM = 2**10
 SEED = 0
-MSM_TEST_DIR = os.path.join(
-    os.path.dirname(__file__), "data", f"t{MSM_DIM}"
-)
+MSM_TEST_DIR = os.path.join(os.path.dirname(__file__), "data", f"t{MSM_DIM}")
 POINTS_PATH = os.path.join(
     MSM_TEST_DIR, f"zprize_msm_curve_377_bases_dim_{MSM_DIM}_seed_{SEED}.csv"
 )
@@ -43,23 +40,39 @@ def _build_msm_parameters():
   ec_parameters = {
       "finite_field_context_class": ff_context.DRNSlazyContext,
       "finite_field_parameters": ff_parameters,
-      "prime": 258664426012969094010652733694893533536393512754914660539884262666720468348340822774968888139573360124440321458177,
-      "order": 8444461749428370424248824938781546531375899335154063827935233455917409239041,
+      "prime": (
+          258664426012969094010652733694893533536393512754914660539884262666720468348340822774968888139573360124440321458177
+      ),
+      "order": (
+          8444461749428370424248824938781546531375899335154063827935233455917409239041
+      ),
       "a": -1,
-      "twist_d": 122268283598675559488486339158635529096981886914877139579534153582033676785385790730042363341236035746924960903179,
+      "twist_d": (
+          122268283598675559488486339158635529096981886914877139579534153582033676785385790730042363341236035746924960903179
+      ),
       "alpha": -1,
       "b": 1,
-      "s": 10189023633222963290707194929886294091415157242906428298294512798502806398782149227503530278436336312243746741931,
-      "MA": 228097355113300204138531148905234651262148041026195375645000724271212049151994375092458297304264351187709081232384,
-      "MB": 10189023633222963290707194929886294091415157242906428298294512798502806398782149227503530278436336312243746741931,
-      "t": 23560188534917577818843641916571445935985386319233886518929971599490231428764380923487987729215299304184915158756,
+      "s": (
+          10189023633222963290707194929886294091415157242906428298294512798502806398782149227503530278436336312243746741931
+      ),
+      "MA": (
+          228097355113300204138531148905234651262148041026195375645000724271212049151994375092458297304264351187709081232384
+      ),
+      "MB": (
+          10189023633222963290707194929886294091415157242906428298294512798502806398782149227503530278436336312243746741931
+      ),
+      "t": (
+          23560188534917577818843641916571445935985386319233886518929971599490231428764380923487987729215299304184915158756
+      ),
       "generator": [
           71222569531709137229370268896323705690285216175189308202338047559628438110820800641278662592954630774340654489393,
           6177051365529633638563236407038680211609544222665285371549726196884440490905471891908272386851767077598415378235,
       ],
   }
   return {
-      "elliptic_curve_context_class": ec_context.ExtendedTwistedEdwardsNDContext,
+      "elliptic_curve_context_class": (
+          ec_context.ExtendedTwistedEdwardsNDContext
+      ),
       "elliptic_curve_parameters": ec_parameters,
       "coordinate_dim": 4,
       "msm_length": MSM_DIM,
@@ -85,7 +98,9 @@ class MSM_BLS12_377_Test(parameterized.TestCase):
     super().setUp()
     self.msm_parameters = _build_msm_parameters()
     self.scalars = utils.read_external_msm_file(SCALARS_PATH, "scalars")
-    self.ref_result = utils.read_external_msm_file(REF_RESULT_PATH, "result_ref")
+    self.ref_result = utils.read_external_msm_file(
+        REF_RESULT_PATH, "result_ref"
+    )
 
   def _run_msm(self, context_class, use_fused):
     ctx = context_class(self.msm_parameters)
@@ -98,9 +113,13 @@ class MSM_BLS12_377_Test(parameterized.TestCase):
     return ctx.to_original_format(result_m)
 
   @parameterized.named_parameters(*MSM_CONTEXT_CASES)
-  def test_multiscalar_multiply_matches_reference(self, context_class, use_fused):
+  def test_multiscalar_multiply_matches_reference(
+      self, context_class, use_fused
+  ):
     result = self._run_msm(context_class, use_fused)
-    np.testing.assert_array_equal(np.asarray(result), np.asarray(self.ref_result))
+    np.testing.assert_array_equal(
+        np.asarray(result), np.asarray(self.ref_result)
+    )
 
 
 if __name__ == "__main__":

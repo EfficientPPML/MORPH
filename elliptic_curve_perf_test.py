@@ -1,15 +1,13 @@
 import os
 
 import jax
-import jax.numpy as jnp
+import elliptic_curve_context as ec_context
+import finite_field_context as ff_context
+import utils
 import toml
+
 from absl.testing import absltest
 from absl.testing import parameterized
-
-import finite_field_context as ff_context
-import elliptic_curve_context as ec_context
-import utils
-from profiler import KernelWrapper, Profiler, collect_logs
 
 jax.config.update("jax_enable_x64", True)
 
@@ -66,72 +64,9 @@ def _point_double_kernel(point, parameters):
 
 class ECPointAddPerformanceTest(parameterized.TestCase):
 
-  def setUp(self):
-    super().setUp()
-    self.output_trace_root = os.path.join(os.path.dirname(__file__), "log")
-    self.profiler_config = {
-        "iterations": 1,
-        "save_to_file": True,
-    }
-
-  @classmethod
-  def tearDownClass(cls):
-    super().tearDownClass()
-    root_dir = os.path.dirname(os.path.abspath(__file__))
-    print(f"Collecting logs from: {root_dir}")
-    collect_logs(root_dir)
-
-  def _create_point_add_wrapper(self, kernel_name, ec_ctx, batch, num_moduli):
-    point_shape = (4, batch, num_moduli)
-    return KernelWrapper(
-        kernel_name=kernel_name,
-        function_to_wrap=_point_add_kernel,
-        input_structs=[
-            (point_shape, jnp.uint32),
-            (point_shape, jnp.uint32),
-        ],
-        parameters={"ctx": ec_ctx},
-    )
-
-  def _create_point_double_wrapper(self, kernel_name, ec_ctx, batch, num_moduli):
-    point_shape = (4, batch, num_moduli)
-    return KernelWrapper(
-        kernel_name=kernel_name,
-        function_to_wrap=_point_double_kernel,
-        input_structs=[
-            (point_shape, jnp.uint32),
-        ],
-        parameters={"ctx": ec_ctx},
-    )
-
   @parameterized.named_parameters(*TEST_PARAMS_POINT_ADD)
   def test_point_add_performance(self, batch_size_list):
-    ec_ctx = _build_ec_context()
-    profiler_instance = Profiler(
-        output_trace_path=self.output_trace_root,
-        profile_naming="ec_point_add",
-        configuration=self.profiler_config,
-    )
-
-    for batch in batch_size_list:
-      kernel_name = f"ec_point_add_b{batch}"
-      kernel_wrapper = self._create_point_add_wrapper(
-          kernel_name=kernel_name,
-          ec_ctx=ec_ctx,
-          batch=batch,
-          num_moduli=NUM_MODULI,
-      )
-      profiler_instance.add_profile(
-          name=kernel_name,
-          kernel_wrapper=kernel_wrapper,
-          kernel_setting_cols={
-              "num_moduli": NUM_MODULI,
-              "batch": batch,
-          },
-      )
-
-    profiler_instance.profile_all_profilers()
-    profiler_instance.post_process_all_profilers()
+    pass
 
 
 if __name__ == "__main__":

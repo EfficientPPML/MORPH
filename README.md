@@ -1,6 +1,6 @@
 <!-- markdownlint-disable MD001 MD041 -->
 <p align="center">
-  <img alt="FEATHER" src="figure_drawer/Morph_logo.png" width=15%>
+  <img alt="MORPH" src="figure_drawer/Morph_logo.png" width=15%>
 </p>
 
 
