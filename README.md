@@ -5,7 +5,7 @@
 
 
 <h3 align="center">
-TPU-accelerated, free, immediate, fast, and cheap HE serving for everyone
+TPU-accelerated, free, immediate, fast, and cheap Zero Knowledge Proof serving for everyone
 </h3>
 <p align="center">
 | <a href="https://arxiv.org/abs/2604.17808">paper</a> |
