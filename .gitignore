@@ -25,3 +25,6 @@ traces/
 .claude
 deployments/
 
+Groth16_TPU/.dev_loop_cache/
+Groth16_TPU/demo/.demo_run/
+Groth16_TPU/demo/.demo_cache/
