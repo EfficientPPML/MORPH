@@ -20,7 +20,7 @@ RNS_MODULI = utils.find_moduli_specified_number(NUM_MODULI, 28)
 MSM_DIM = 2**10
 SEED = 0
 MSM_TEST_DIR = os.path.join(
-    os.path.dirname(__file__), "data", f"t{MSM_DIM}"
+    os.path.dirname(__file__), "data", "msm_test_cases", f"t{MSM_DIM}"
 )
 POINTS_PATH = os.path.join(
     MSM_TEST_DIR, f"zprize_msm_curve_377_bases_dim_{MSM_DIM}_seed_{SEED}.csv"

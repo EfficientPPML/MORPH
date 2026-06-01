@@ -1,5 +1,9 @@
 import math
 import logging
+import multiprocessing
+import os
+from concurrent.futures import ProcessPoolExecutor
+from functools import partial
 from typing import Union
 from abc import ABC, abstractmethod
 import numpy as np
@@ -10,6 +14,85 @@ import utils
 from utils import JaxKernelContextBase, JaxParameters, hash_args, pad_jax_array, store_jax_executable, load_jax_executable, jax_jit_lower_compile
 
 jax.config.update("jax_enable_x64", True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Multiprocessing helpers for DRNS conversion (T11)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Use 'forkserver' to match the rest of the codebase (avoids JAX + fork deadlocks).
+_FFC_MP_CONTEXT = multiprocessing.get_context("forkserver")
+
+# Leaf-count below which the single-threaded path is faster (process startup
+# + pickle overhead dominates for small inputs).
+_PARALLEL_THRESHOLD = 4096
+
+
+def _drns_decode_chunk_worker(
+    rows: np.ndarray,
+    moduli: list,
+    moduli_inv_on_radix: list,
+    crt_factors: list,
+    total_modulus: int,
+    prime: int,
+    radix_bits: int,
+) -> list:
+    """Worker: decode a chunk of DRNS rows to Python big ints.
+
+    rows : (chunk_size, M) uint32 — each row is one DRNS-encoded value.
+    Returns a length-chunk_size list of Python ints in [0, prime).
+
+    Mirrors the math of
+    ``DRNSlazyContext.to_original_format._individual_convert`` but
+    inlined so the worker is independent of the class instance.
+    """
+    M = rows.shape[1]
+    mask = (1 << radix_bits) - 1
+    out = []
+    for row_i in range(rows.shape[0]):
+        # Montgomery reduce (per-modulus).
+        t = [0] * M
+        for i in range(M):
+            z = int(rows[row_i, i])
+            z_low = z & mask
+            z_high = z >> radix_bits
+            q = (z_low * moduli_inv_on_radix[i]) & mask
+            h = (q * moduli[i]) >> radix_bits
+            t[i] = (z_high - h) + moduli[i]
+        # CRT reconstruction.
+        r = 0
+        for i in range(M):
+            r = (r + t[i] * crt_factors[i]) % total_modulus
+        out.append(r % prime)
+    return out
+
+
+def _drns_encode_chunk_worker(
+    ints: list,
+    moduli: list,
+    radix_bits: int,
+) -> np.ndarray:
+    """Worker: encode a flat list of Python big ints into DRNS uint32 rows.
+
+    Returns shape ``(len(ints), len(moduli))`` uint32.
+    """
+    M = len(moduli)
+    out = np.empty((len(ints), M), dtype=np.uint32)
+    for row_i, a in enumerate(ints):
+        a_int = int(a)
+        for i, m in enumerate(moduli):
+            out[row_i, i] = ((a_int % m) << radix_bits) % m
+    return out
+
+
+def _num_drns_workers(num_leaves: int) -> int:
+    """Pick a worker count: bounded by leaves/256 and by 4 (TPU host limit)."""
+    cpu_n = os.cpu_count() or 1
+    return max(1, min(cpu_n, 4, num_leaves // 1024))
+
+
+class _Bailout(Exception):
+    """Internal sentinel — abort the parallel encode walk and fall back."""
 
 
 class FiniteFieldContextBase(ABC):
@@ -349,24 +432,108 @@ class DRNSlazyContext(DRNSlazyContextBase, JaxKernelContextBase):
     moduli = self.rns_moduli
     radix_bits = self.radix_bits
 
-    def individual_convert(a: int) -> list:
-      return [(((a % m) << radix_bits) % m) for m in moduli]
+    # Try the parallel fast path for large nested inputs.
+    parallel_result = self._maybe_to_computational_parallel(a)
+    if parallel_result is not None:
+      converted_a = parallel_result
+    else:
+      def individual_convert(a: int) -> list:
+        return [(((a % m) << radix_bits) % m) for m in moduli]
 
-    def recursive_convert(a):
-      if isinstance(a, int):
-        return individual_convert(a)
-      return [recursive_convert(a_i) for a_i in a]
+      def recursive_convert(a):
+        if isinstance(a, int):
+          return individual_convert(a)
+        return [recursive_convert(a_i) for a_i in a]
 
-    converted_list = recursive_convert(a)
-    converted_a = jnp.array(np.array(converted_list, dtype=np.uint32), dtype=jnp.uint32)
+      converted_list = recursive_convert(a)
+      converted_a = jnp.array(np.array(converted_list, dtype=np.uint32), dtype=jnp.uint32)
+
     if self.use_sharding:
       named_sharding, padded_shape = self.create_named_sharding(shape=converted_a.shape, axes=[0])
       converted_a = pad_jax_array(converted_a, padded_shape)
       return converted_a.to_device(named_sharding)
     else:
-      return converted_a.to_device(jax.devices()[0])
+      return converted_a.to_device(jax.devices("tpu")[0])
+
+  def _maybe_to_computational_parallel(self, a) -> Union[jnp.ndarray, None]:
+    """If ``a`` is a deeply-nested int list with enough leaves to amortise
+    process-pool overhead, do the conversion in parallel and return a
+    JAX array; otherwise return None (caller falls back to the
+    single-threaded path).
+    """
+    # Cheap structural check: only attempt parallel for "rectangular"
+    # nested lists of Python ints (which is what the QAP encode and the
+    # H-pipeline use).  Anything else falls through.
+    if isinstance(a, int) or not isinstance(a, list):
+      return None
+    # Determine nested shape by following the [0][0]... chain; if any
+    # branch turns out non-rectangular we bail.
+    shape = []
+    cur = a
+    while isinstance(cur, list):
+      shape.append(len(cur))
+      if not cur:
+        return None
+      cur = cur[0]
+    if not isinstance(cur, int):
+      return None
+    total_leaves = 1
+    for d in shape:
+      total_leaves *= d
+    if total_leaves < _PARALLEL_THRESHOLD:
+      return None
+
+    # Flatten with a verifying walk — if anywhere the structure doesn't
+    # match the inferred shape, bail back to the single-threaded path.
+    flat = []
+    def walk(node, depth):
+      if depth == len(shape):
+        if not isinstance(node, int):
+          raise _Bailout()
+        flat.append(node)
+        return
+      if not isinstance(node, list) or len(node) != shape[depth]:
+        raise _Bailout()
+      for child in node:
+        walk(child, depth + 1)
+
+    try:
+      walk(a, 0)
+    except _Bailout:
+      return None
+
+    workers = _num_drns_workers(total_leaves)
+    chunk_rows = math.ceil(total_leaves / max(workers, 1))
+    chunks = [flat[i:i + chunk_rows] for i in range(0, total_leaves, chunk_rows)]
+    worker_fn = partial(
+        _drns_encode_chunk_worker,
+        moduli=self.rns_moduli,
+        radix_bits=self.radix_bits,
+    )
+
+    if workers <= 1:
+      flat_arr = worker_fn(flat)
+    else:
+      with ProcessPoolExecutor(max_workers=workers, mp_context=_FFC_MP_CONTEXT) as pool:
+        chunk_results = list(pool.map(worker_fn, chunks))
+      flat_arr = np.concatenate(chunk_results, axis=0)
+
+    M = len(self.rns_moduli)
+    return jnp.asarray(flat_arr.reshape(*shape, M), dtype=jnp.uint32)
 
   def to_original_format(self, a: jnp.ndarray) -> Union[int, list]:
+    # Materialise to numpy once; the recursive walker only needs host-side
+    # data.  This also lets the parallel fast path slice / pickle cheaply.
+    a_np = np.asarray(a) if not isinstance(a, np.ndarray) else a
+
+    # Per-leaf row count.  Last axis is M (residues); everything else is
+    # batch dimensions.  If total leaves >= threshold, route through a
+    # ProcessPoolExecutor (T11) so the big-int Montgomery + CRT work
+    # parallelises across CPU cores.
+    if a_np.ndim >= 2 and int(np.prod(a_np.shape[:-1])) >= _PARALLEL_THRESHOLD:
+      return self._to_original_format_parallel(a_np)
+
+    # Original single-threaded path (small inputs / unrecognised shape).
     def individual_convert(a: list[int]) -> int:
       a = self._elementwise_montgomery_reduce(a, self.rns_moduli, self.moduli_inv_on_radix)
       r = 0
@@ -379,7 +546,62 @@ class DRNSlazyContext(DRNSlazyContextBase, JaxKernelContextBase):
         return individual_convert(a.tolist())
       return [recursive_convert(a_i) for a_i in a]
 
-    return recursive_convert(a)
+    return recursive_convert(a_np)
+
+  def _to_original_format_parallel(self, a_np: np.ndarray):
+    """Parallelised DRNS → Python int conversion.  Splits the (..., M)
+    input along the flattened leading axis into per-worker chunks and
+    farms out the Montgomery+CRT math; reshapes the result back into the
+    original nested-list structure.
+    """
+    orig_shape = a_np.shape[:-1]                     # leading dims
+    M          = a_np.shape[-1]                      # residues per leaf
+    flat       = a_np.reshape(-1, M)                 # (N, M) uint32
+    N          = flat.shape[0]
+
+    workers = _num_drns_workers(N)
+    if workers <= 1:
+      # Defensive: shouldn't happen given _PARALLEL_THRESHOLD, but keep
+      # a graceful fallback.
+      worker_fn = partial(
+          _drns_decode_chunk_worker,
+          moduli=self.rns_moduli,
+          moduli_inv_on_radix=self.moduli_inv_on_radix,
+          crt_factors=self.crt_factors,
+          total_modulus=self.total_modulus,
+          prime=self.prime,
+          radix_bits=self.radix_bits,
+      )
+      flat_ints = worker_fn(flat)
+    else:
+      # Split into ~equal chunks; one task per worker (chunksize=1 inside
+      # pool.map). Each chunk pickle is ~ (N/workers) * M * 4 bytes.
+      chunk_rows = math.ceil(N / workers)
+      chunks = [flat[i:i + chunk_rows] for i in range(0, N, chunk_rows)]
+      worker_fn = partial(
+          _drns_decode_chunk_worker,
+          moduli=self.rns_moduli,
+          moduli_inv_on_radix=self.moduli_inv_on_radix,
+          crt_factors=self.crt_factors,
+          total_modulus=self.total_modulus,
+          prime=self.prime,
+          radix_bits=self.radix_bits,
+      )
+      with ProcessPoolExecutor(max_workers=workers, mp_context=_FFC_MP_CONTEXT) as pool:
+        chunk_results = list(pool.map(worker_fn, chunks))
+      flat_ints = [v for chunk in chunk_results for v in chunk]
+
+    # Reshape flat list back into the original nested structure.
+    def reshape(items, dims):
+      if not dims:
+        return items[0]
+      head, *tail = dims
+      step = 1
+      for d in tail:
+        step *= d
+      return [reshape(items[i * step:(i + 1) * step], tail) for i in range(head)]
+
+    return reshape(flat_ints, list(orig_shape))
 
   def _get_shape_dtype_structs(self, parameters: dict) -> list[jax.ShapeDtypeStruct]:
     batch_shape = parameters["batch_shape"]
@@ -741,7 +963,7 @@ class CROSSLazyContext(LazyContextBase, JaxKernelContextBase):
       converted_a = pad_jax_array(converted_a, padded_shape)
       return converted_a.to_device(named_sharding)
     else:
-      return converted_a.to_device(jax.devices()[0])
+      return converted_a.to_device(jax.devices("tpu")[0])
 
   def to_original_format(self, a: jnp.ndarray):
     def _convert(arr) -> int:

@@ -101,6 +101,21 @@ class BLS12_377_Test(parameterized.TestCase):
 
     np.testing.assert_array_equal(result, ref_result)
 
+  @parameterized.named_parameters(*BLS12_377_TEST_CASES)
+  def test_ExtendedTwistedEdwards_point_double(self, point_batch_1, point_batch_2):
+    ec_parameters, ref_ec_parameters = _build_ec_parameters()
+
+    ec_ctx = ec_context.ExtendedTwistedEdwardsContext(ec_parameters)
+    ref_ec_ctx = ec_context.CPUWeierstrassAffineContext(ref_ec_parameters)
+
+    point_batch_1_m = ec_ctx.to_computational_format(point_batch_1)
+    result_m = ec_ctx.point_double(point_batch_1_m)
+    result = ec_ctx.to_original_format(result_m)
+
+    ref_result = ref_ec_ctx._point_double(point_batch_1)
+
+    np.testing.assert_array_equal(result, ref_result)
+
 
 # Test points for ND context tests
 P1 = [
@@ -239,6 +254,34 @@ class BLS12_377_ND_Test(parameterized.TestCase):
     result_2d = nd_ctx.to_original_format(nd_ctx.point_add(a_2d, b_2d))
 
     np.testing.assert_array_equal(result_2d[0], result_1d)
+
+  def test_nd_point_double_vs_cpu_ref(self):
+    """1D batch: point_double must match CPUWeierstrassAffineContext._point_double."""
+    nd_ctx = ec_context.ExtendedTwistedEdwardsNDContext(self.ec_parameters)
+    batch = [P1, P2]
+    batch_m = nd_ctx.to_computational_format(batch)
+    result = nd_ctx.to_original_format(nd_ctx.point_double(batch_m))
+    ref_result = self.ref_ec_ctx._point_double(batch)
+    np.testing.assert_array_equal(result, ref_result)
+
+  def test_nd_point_double_equals_double_add(self):
+    """point_double(P) must equal point_add(P, P)."""
+    nd_ctx = ec_context.ExtendedTwistedEdwardsNDContext(self.ec_parameters)
+    batch = [P1, P2]
+    batch_m = nd_ctx.to_computational_format(batch)
+    result_double = nd_ctx.to_original_format(nd_ctx.point_double(batch_m))
+    result_add = nd_ctx.to_original_format(nd_ctx.point_add(batch_m, batch_m))
+    np.testing.assert_array_equal(result_double, result_add)
+
+  def test_nd_point_double_2d_batch(self):
+    """2D batch: point_double verified element-wise against CPU ref."""
+    nd_ctx = ec_context.ExtendedTwistedEdwardsNDContext(self.ec_parameters)
+    batch = [[P1, P2], [P3, P4]]
+    batch_m = nd_ctx.to_computational_format(batch)
+    result = nd_ctx.to_original_format(nd_ctx.point_double(batch_m))
+    for i, row in enumerate(batch):
+      ref = self.ref_ec_ctx._point_double(row)
+      np.testing.assert_array_equal(result[i], ref)
 
 
 if __name__ == "__main__":

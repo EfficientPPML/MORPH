@@ -133,6 +133,35 @@ class ECPointAddPerformanceTest(parameterized.TestCase):
     profiler_instance.profile_all_profilers()
     profiler_instance.post_process_all_profilers()
 
+  @parameterized.named_parameters(*TEST_PARAMS_POINT_DOUBLE)
+  def test_point_double_performance(self, batch_size_list):
+    ec_ctx = _build_ec_context()
+    profiler_instance = Profiler(
+        output_trace_path=self.output_trace_root,
+        profile_naming="ec_point_double",
+        configuration=self.profiler_config,
+    )
+
+    for batch in batch_size_list:
+      kernel_name = f"ec_point_double_b{batch}"
+      kernel_wrapper = self._create_point_double_wrapper(
+          kernel_name=kernel_name,
+          ec_ctx=ec_ctx,
+          batch=batch,
+          num_moduli=NUM_MODULI,
+      )
+      profiler_instance.add_profile(
+          name=kernel_name,
+          kernel_wrapper=kernel_wrapper,
+          kernel_setting_cols={
+              "num_moduli": NUM_MODULI,
+              "batch": batch,
+          },
+      )
+
+    profiler_instance.profile_all_profilers()
+    profiler_instance.post_process_all_profilers()
+
 
 if __name__ == "__main__":
   absltest.main()
